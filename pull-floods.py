@@ -119,7 +119,7 @@ def get_product_list(headers, aoi_id, date_from, date_to):
         'to': date_to,
         'time': 'range',  # options: range, latest, all
     }
-    products_response = httpx.get(f'{HOST}/aoi/{aoi_id}/products', headers=headers, params=params, timeout=1000)
+    products_response = httpx.get(f'{HOST}/aoi/{aoi_id}/products', headers=headers, params=params, timeout=2000)
     products_response.raise_for_status()
     df = pd.json_normalize(
         products_response.json(),
