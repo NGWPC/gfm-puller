@@ -1,2 +1,4 @@
+.env
 TestOutput/
 Data/
+__pycache__/
