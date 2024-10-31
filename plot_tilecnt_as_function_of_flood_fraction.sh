@@ -1,5 +1,4 @@
 #!/bin/bash
-
 # Note: script needs to be run from the directory where the gfm data is!
 # Find all JSON files and combine them into one
 echo "Combining all JSON files into 'combined.json'..."
@@ -20,13 +19,14 @@ done
 # Plot the data using Gnuplot
 echo "Plotting data with Gnuplot..."
 gnuplot -persist <<-EOFMarker
-    set terminal png size 800,600
+    set terminal png size 1600,1200 enhanced font "arial,20"
     set output 'plot.png'
-    set title 'Number of Subtiles With Flood Fraction Greater Than or Equal to Given Flood fraction'
-    set xlabel 'Flood Fraction'
-    set ylabel 'Number of Subtiles'
+    set title '{/Bold Number of Subtiles With FB_{rat} Greater Than or Equal to Given Flood fraction}'
+    set xlabel '{/Bold Flood to Baseline Ratio}'
+    set ylabel '{/Bold Number of Subtiles}'
+    set xtics font ",bold"
+    set ytics font ",bold"
     set grid
-    plot 'data.txt' using 1:2 with linespoints lw 2 title 'Values >= Count'
+    plot 'data.txt' using 1:2 with linespoints lw 2 title '{/Bold Tiles >= FB_{rat}}'
 EOFMarker
-
 echo "Plot saved as 'plot.png'."
