@@ -792,7 +792,9 @@ class Controller:
         gfm_client = GFMClient(self.config)
 
         # set number of processes for parallel mode. 
-        num_processes = 7
+        num_cores = cpu_count()
+        num_processes = max(1, num_cores - 1)  # Use N-1 cores, minimum of 1
+        self.logger.info(f"Using {num_processes} processes out of {num_cores} available cores")
 
         try:
             date_range = self._get_date_range(year, month)
