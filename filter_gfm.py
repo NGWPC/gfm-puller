@@ -1,6 +1,7 @@
 import pdb
 import argparse
 import os
+import sys
 import json
 import csv
 import logging
@@ -81,10 +82,24 @@ class Config:
 class S3Uploader:
     """Handles all S3 upload operations."""
     def __init__(self, config: Config):
+        # Verify AWS credentials are available
+        if not os.getenv('AWS_ACCESS_KEY_ID') or not os.getenv('AWS_SECRET_ACCESS_KEY'):
+            print("ERROR: AWS credentials not found in environment variables.")
+            print("Please ensure AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set.")
+            sys.exit(1)
+
         self.bucket = config.s3_bucket
         self.key_root = config.key_root
         self.threshold = config.flood_threshold
-        self.s3_client = boto3.client('s3')
+        
+        try:
+            self.s3_client = boto3.client('s3')
+            # Test connection by trying to access the bucket
+            self.s3_client.head_bucket(Bucket=self.bucket)
+        except Exception as e:
+            print(f"ERROR: Failed to initialize S3 connection: {str(e)}")
+            print("Please check your AWS credentials and bucket configuration.")
+            sys.exit(1)
 
     def upload_product_files(self, product_path: str, flood_fractions: dict, flowfile: Optional[pd.DataFrame] = None):
         """
@@ -718,15 +733,15 @@ class Controller:
         self.config = config
         self.gfm_client = GFMClient(config)
         
+        self.s3_uploader = S3Uploader(config)
+
         # Initialize FlowProcessor with both hydrofabric paths
         hydrofabric_paths = {
             'main_hydrofabric': config.paths['main_hydrofabric'],
             'ak_hydrofabric': config.paths['ak_hydrofabric']
         }
         self.flow_processor = FlowProcessor(hydrofabric_paths)
-        
-        self.s3_uploader = S3Uploader(config)
-        
+             
         # Create necessary directories
         os.makedirs(config.paths['output'], exist_ok=True)
         os.makedirs(config.paths['temp'], exist_ok=True)
