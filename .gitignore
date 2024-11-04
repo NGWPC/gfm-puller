@@ -2,3 +2,8 @@
 TestOutput/
 Data/
 __pycache__/
+output/
+temp/
+hydrofabrics/
+AOI/
+logs/

@@ -1,3 +1,5 @@
+import pdb
+import argparse
 import os
 import json
 import csv
@@ -10,6 +12,10 @@ import geopandas as gpd
 import rasterio
 import boto3
 import httpx
+import re  
+import urllib.request  
+from shapely.geometry import shape, Polygon  
+from typing import List  
 import tempfile
 import zipfile
 import shutil
@@ -17,11 +23,10 @@ from pathlib import Path
 import posixpath
 from google.cloud import storage
 import xarray as xr
-import tempfile
+from dotenv import load_dotenv
 
 @dataclass
 class Config:
-    """Simplified configuration class."""
     flood_threshold: float
     s3_bucket: str
     key_root: str
@@ -30,16 +35,44 @@ class Config:
 
     @classmethod
     def from_env(cls):
+        # Load .env file 
+        load_dotenv()  
+
+        """Create Config from environment variables."""
+        required_vars = {
+            'FLOOD_THRESHOLD': float,
+            'S3_BUCKET': str,
+            'KEY_ROOT': str,
+            'GFM_EMAIL': str,
+            'GFM_PASSWORD': str,
+            'NWM_MAIN_HYDROFABRIC_PATH': str,
+            'NWM_AK_HYDROFABRIC_PATH': str
+        }
+    
+        # Check for missing variables
+        missing = [var for var in required_vars if not os.getenv(var)]
+        if missing:
+            raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+    
+        # Validate types
+        env_vars = {}
+        for var, var_type in required_vars.items():
+            try:
+                env_vars[var.lower()] = var_type(os.getenv(var))
+            except ValueError:
+                raise ValueError(f"Invalid value for {var}: must be {var_type.__name__}")
+
         return cls(
-            flood_threshold=float(os.getenv('FLOOD_THRESHOLD')),
-            s3_bucket=os.getenv('S3_BUCKET'),
-            key_root=os.getenv('KEY_ROOT').strip('/'),
+            flood_threshold=env_vars['flood_threshold'],
+            s3_bucket=env_vars['s3_bucket'],
+            key_root=env_vars['key_root'].strip('/'),
             credentials={
-                'gfm_email': os.getenv('GFM_EMAIL'),
-                'gfm_password': os.getenv('GFM_PASSWORD')
+                'gfm_email': env_vars['gfm_email'],
+                'gfm_password': env_vars['gfm_password']
             },
             paths={
-                'hydrofabric': os.getenv('NWM_HYDROFABRIC_PATH'),
+                'main_hydrofabric': env_vars['nwm_main_hydrofabric_path'],
+                'ak_hydrofabric': env_vars['nwm_ak_hydrofabric_path'],
                 'output': os.getenv('OUTPUT_PATH', 'output'),
                 'temp': os.getenv('TEMP_PATH', 'temp')
             }
@@ -62,6 +95,15 @@ class S3Uploader:
             flood_fractions: Dictionary of flood fractions by tile
             flowfile: Optional DataFrame containing flow data
         """
+        if not os.path.exists(product_path):
+            raise ValueError(f"Product path does not exist: {product_path}")
+        
+        if not isinstance(flood_fractions, dict):
+            raise ValueError("flood_fractions must be a dictionary")
+        
+        if flowfile is not None and not isinstance(flowfile, pd.DataFrame):
+            raise ValueError("flowfile must be a pandas DataFrame or None")
+
         # Get product ID and date from path
         product_id = os.path.basename(product_path)
         date_input = self._extract_date_from_product_id(product_id)
@@ -119,53 +161,135 @@ class GFMClient:
     def __init__(self, config: Config):
         self.config = config
         self.headers = None
+        self.user_id = None
+        self.host = 'https://api.gfm.eodc.eu/v2'
         self._authenticate()
 
     def _authenticate(self):
         """Authenticate with GFM API."""
-        response = httpx.post(
-            'https://api.gfm.eodc.eu/v2/auth/login',
-            json=self.config.credentials
-        )
-        self.headers = {'Authorization': f"Bearer {response.json()['access_token']}"}
+        headers = {
+            'accept': 'application/json',
+            'Content-Type': 'application/json'
+        }
+        params = {
+            'email': self.config.credentials['gfm_email'],
+            'password': self.config.credentials['gfm_password']
+        }
+        
+        auth_response = httpx.post(f'{self.host}/auth/login', headers=headers, json=params)
+        auth_response.raise_for_status()
+        
+        self.user_id = auth_response.json()['client_id']
+        self.headers = {
+            'accept': 'application/json',
+            'Authorization': f"Bearer {auth_response.json()['access_token']}",
+            'Content-Type': 'application/json'
+        }
 
-    def get_products(self, date_range: tuple) -> list:
-        """Get list of products for date range."""
-        response = httpx.get(
-            'https://api.gfm.eodc.eu/v2/products',
+    def get_products(self, date_range: tuple, aoi_id: str) -> list:
+        """
+        Get list of products for date range and AOI.
+        
+        Args:
+            date_range: Tuple of (start_date, end_date)
+            aoi_coordinates: List of coordinates forming polygon
+        """
+    
+        # Get products for AOI
+        params = {
+            'from': date_range[0],
+            'to': date_range[1],
+            'time': 'range'
+        }
+        
+        products_response = httpx.get(
+            f'{self.host}/aoi/{aoi_id}/products',
             headers=self.headers,
-            params={'from': date_range[0], 'to': date_range[1]}
+            params=params,
+            timeout=2000
         )
-        return response.json()['products']
+        products_response.raise_for_status()
+        
+        return products_response.json().get('products', [])
 
-    def download_product(self, product_id: str) -> 'Product':
-        """Download and extract product, return Product instance."""
-        # Get download link
-        response = httpx.get(
-            f'https://api.gfm.eodc.eu/v2/download/{product_id}',
-            headers=self.headers
+    def _create_aoi(self, coordinates: list) -> str:
+        if not coordinates:
+            raise ValueError("Empty coordinates provided")
+        
+        coords_to_use = [coordinates]
+
+        aoi_params = {
+            "aoi_name": "Example AOI",
+            "description": "An example region of interest",
+            "user_id": self.user_id,
+            "geoJSON": {
+                "type": "Polygon",
+                "coordinates": coords_to_use
+            },
+            "skip_aoi_check": "false"
+        }
+
+        aoi_response = httpx.post(
+            f'{self.host}/aoi/create',
+            headers=self.headers,
+            json=aoi_params,
+            timeout=600
         )
-        download_link = response.json()['download_link']
+        aoi_response.raise_for_status()
         
-        # Create temp directory for this product
-        extract_path = os.path.join(self.config.paths['temp'], product_id)
-        os.makedirs(extract_path, exist_ok=True)
+        return aoi_response.json()['aoi_id']
+
+    def download_product(self, product_id: str, aoi_id: str) -> 'Product':
+        """
+        Download and extract a product.
         
-        # Download and extract
-        download_path = os.path.join(self.config.paths['temp'], f'{product_id}.zip')
-        urllib.request.urlretrieve(download_link, download_path)
+        Args:
+            product_id: ID of the product to download
+            aoi_id: ID of the AOI used to query products
         
-        with zipfile.ZipFile(download_path, 'r') as zip_ref:
-            zip_ref.extractall(extract_path)
-        
-        # Clean up zip file
-        os.remove(download_path)
-        
-        return Product(
-            id=product_id,
-            date=self._parse_date_from_product_id(product_id),
-            extract_path=extract_path
-        )
+        Returns:
+            Path to extracted product directory
+        """
+        download_path = None
+        extract_path = None
+        try:
+            # Get download link
+            download_response = httpx.get(
+                f'{self.host}/download/scene-product/{product_id}/{aoi_id}',
+                headers=self.headers,
+                timeout=600
+            )
+            download_response.raise_for_status()
+            download_link = download_response.json()['download_link']
+
+            # Create temp directory for this product
+            extract_path = os.path.join(self.config.paths['temp'], product_id)
+            os.makedirs(extract_path, exist_ok=True)
+
+            # Download the file
+            download_path = os.path.join(self.config.paths['temp'], f'{product_id}.zip')
+            urllib.request.urlretrieve(download_link, download_path)
+
+            # Extract the zip file
+            with zipfile.ZipFile(download_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_path)
+
+            # Clean up zip file
+            os.remove(download_path)
+
+            return Product(
+                id=product_id,
+                date=self._parse_date_from_product_id(product_id),
+                extract_path=extract_path
+            )
+
+        except Exception as e:
+            logging.error(f"Failed to download product {product_id}: {str(e)}")
+            if os.path.exists(download_path):
+                os.remove(download_path)
+            if os.path.exists(extract_path):
+                shutil.rmtree(extract_path)
+            raise
 
     @staticmethod
     def _parse_date_from_product_id(product_id: str) -> datetime:
@@ -187,7 +311,7 @@ class Product:
         # Find and process all flood and reference water files
         for root, _, files in os.walk(self.extract_path):
             for file in files:
-                if 'ENSEMBLE_FLOOD' in file:
+                if 'ENSEMBLE_FLOOD' in file and 'tif' in file:
                     tile_id = self._extract_tile_id(file)
                     flood_path = os.path.join(root, file)
                     ref_path = self._find_reference_file(root, tile_id)
@@ -200,17 +324,17 @@ class Product:
 
     def get_scene_info(self) -> dict:
         """Get scene polygon and datetime."""
-        metadata_file = next(
-            (f for f in os.listdir(self.extract_path) if f.endswith('_metadata.json')),
+        footprint_file = next(
+            (f for f in os.listdir(self.extract_path) if 'footprint' in f.lower()),
             None
         )
         
-        if metadata_file:
-            with open(os.path.join(self.extract_path, metadata_file)) as f:
-                metadata = json.load(f)
+        if footprint_file:
+            with open(os.path.join(self.extract_path, footprint_file)) as f:
+                footprint = json.load(f)
                 return {
                     'datetime': self.date,
-                    'polygon': shape(metadata['geometry'])
+                    'polygon': shape(footprint['geometry'])
                 }
         return None
 
@@ -240,27 +364,46 @@ class Product:
 
 class FlowProcessor:
     """Handles all flow data processing and NWM data extraction."""
-    def __init__(self, hydrofabric_path: str):
+    VALID_REGIONS = {'conus', 'alaska', 'hawaii'}
+    
+    def __init__(self, hydrofabric_paths: Dict[str, str]):
         """
         Initialize the flow processor.
         
         Args:
-            hydrofabric_path: Path to the NWM hydrofabric GeoPackage
+            hydrofabric_paths: Dict containing paths to hydrofabric files
+                             ('main_hydrofabric' and 'ak_hydrofabric')
         """
-        # Load hydrofabric features
-        self.features = gpd.read_file(hydrofabric_path)
-        if 'ID' not in self.features.columns:
-            raise ValueError("GeoPackage must contain 'ID' column")
+        self.hydrofabric_paths = hydrofabric_paths
+        self.features = {}
         
-        # Ensure proper CRS
-        if self.features.crs != "EPSG:4326":
-            self.features = self.features.to_crs("EPSG:4326")
+        # Load main hydrofabric for conus and hawaii
+        print("Loading nwm features.")
+        main_features = self._load_hydrofabric(hydrofabric_paths['main_hydrofabric'])
+        self.features['conus'] = main_features
+        self.features['hawaii'] = main_features
         
+        # Load Alaska hydrofabric
+        self.features['alaska'] = self._load_hydrofabric(hydrofabric_paths['ak_hydrofabric'])
+        print("Finished loading nwm features.")
+
         # Initialize GCS client for NWM data
         self.gcs_client = storage.Client.create_anonymous_client()
         self.nwm_bucket = self.gcs_client.bucket("national-water-model")
 
-    def create_flowfile(self, polygon: Polygon, target_datetime: datetime) -> pd.DataFrame:
+    def _load_hydrofabric(self, path: str) -> gpd.GeoDataFrame:
+        """Load and validate a hydrofabric file."""
+        features = gpd.read_file(path)
+        if 'ID' not in features.columns:
+            raise ValueError(f"Hydrofabric at {path} must contain 'ID' column")
+        
+        # Ensure proper CRS
+        if features.crs != "EPSG:4326":
+            features = features.to_crs("EPSG:4326")
+            
+        return features
+
+    def create_flowfile(self, polygon: Polygon, target_datetime: datetime, region: str = 'conus') -> pd.DataFrame:
         """
         Create flowfile for a given polygon and datetime.
         
@@ -271,26 +414,33 @@ class FlowProcessor:
         Returns:
             DataFrame with feature_id and streamflow columns
         """
-        # Get features in polygon
-        feature_ids = self.get_features_in_polygon(polygon)
+        if region not in self.VALID_REGIONS:
+            raise ValueError(f"Invalid region. Must be one of {self.VALID_REGIONS}")
+            
+        # Get features in polygon using region-specific hydrofabric
+        feature_ids = self.get_features_in_polygon(polygon, region)
         if not feature_ids:
-            logging.warning("No features found in polygon")
+            logging.warning(f"No features found in polygon for region {region}")
             return pd.DataFrame(columns=['feature_id', 'streamflow'])
 
         # Get flow data for features
-        flow_data = self.get_flow_data(target_datetime, 'conus')
+        flow_data = self.get_flow_data(target_datetime, region)
         
         if flow_data is None:
-            logging.warning("No flow data found for datetime")
+            logging.warning(f"No flow data found for datetime in region {region}")
             return pd.DataFrame(columns=['feature_id', 'streamflow'])
 
         # Filter flow data to features in polygon
         return flow_data[flow_data['feature_id'].isin(feature_ids)]
 
-    def get_features_in_polygon(self, polygon: Polygon) -> List[str]:
+    def get_features_in_polygon(self, polygon: Polygon, region: str) -> List[str]:
         """Get feature IDs that intersect with or are within the polygon."""
-        mask = self.features.intersects(polygon) | self.features.within(polygon)
-        return self.features[mask]['ID'].tolist()
+        if region not in self.VALID_REGIONS:
+            raise ValueError(f"Invalid region. Must be one of {self.VALID_REGIONS}")
+            
+        features = self.features[region]
+        mask = features.intersects(polygon) | features.within(polygon)
+        return features[mask]['ID'].tolist()
 
     def get_flow_data(self, target_datetime: datetime, region: str = 'conus') -> Optional[pd.DataFrame]:
         """
@@ -390,9 +540,11 @@ class ProcessingRecord:
     """Holds processing record for each product."""
     product_id: str
     start_time: datetime
+    region: str  
     status: str = ""
     error: str = ""
     has_flowfile: bool = False
+    was_uploaded: bool = False
     flood_fraction_max: float = 0.0
     end_time: datetime = field(default_factory=datetime.now)
 
@@ -403,11 +555,12 @@ class ProcessingRecord:
         self.status = "failed"
         self.error = error_message
 
-    def update_on_success(self, flood_fractions: dict, has_flowfile: bool):
+    def update_on_success(self, flood_fractions: dict, has_flowfile: bool, was_uploaded: bool):  
         """Update record when processing succeeds."""
         self.end_time = datetime.now()
         self.status = "success"
         self.has_flowfile = has_flowfile
+        self.was_uploaded = was_uploaded
         self.flood_fraction_max = max(flood_fractions.values(), default=0.0)
 
 class Logger:
@@ -441,52 +594,67 @@ class Logger:
         )
 
         # Create logger
-        self.logger = logging.getLogger(f"gfm_processor_{self.run_timestamp}")
-        self.logger.setLevel(logging.INFO)
-        self.logger.addHandler(file_handler)
-        self.logger.propagate = False
+        self._logger = logging.getLogger(f"gfm_processor_{self.run_timestamp}")
+        self._logger.setLevel(logging.INFO)
+        self._logger.addHandler(file_handler)
+        self._logger.propagate = False
+
+    def info(self, message: str):
+        """Log an info message."""
+        self._logger.info(message)
+
+    def error(self, message: str):
+        """Log an error message."""
+        self._logger.error(message)
+
+    def warning(self, message: str):
+        """Log a warning message."""
+        self._logger.warning(message)
 
     def _setup_csv(self):
         """Set up CSV logging."""
-        self.csv_path = self.log_dir / f"processing_records.csv"
+        self.csv_path = self.log_dir / f"product_status.csv"
         
         with open(self.csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
                 "product_id",
+                "region",
                 "status",
                 "error",
                 "has_flowfile",
+                "was_uploaded",
                 "max_flood_fraction",
                 "start_time",
                 "end_time",
                 "processing_duration_seconds"
             ])
 
-    def start_product_processing(self, product_id: str) -> ProcessingRecord:
-        """Start tracking a product's processing."""
+    def start_product_processing(self, product_id: str, region: str) -> ProcessingRecord:
         record = ProcessingRecord(
             product_id=product_id,
-            start_time=datetime.now()
+            start_time=datetime.now(),
+            region=region
         )
         self.processing_records.append(record)
-        self.logger.info(f"Starting processing of product: {product_id}")
+        self.info(f"Starting processing of product: {product_id}")
         return record
 
-    def log_product_success(self, record: ProcessingRecord, flood_fractions: dict, has_flowfile: bool):
+    def log_product_success(self, record: ProcessingRecord, flood_fractions: dict, has_flowfile: bool, was_uploaded: bool):
         """Log successful product processing."""
-        record.update_on_success(flood_fractions, has_flowfile)
-        self.logger.info(
+        record.update_on_success(flood_fractions, has_flowfile, was_uploaded)
+        self.info(
             f"Successfully processed product {record.product_id}. "
             f"Max flood fraction: {record.flood_fraction_max:.2%}, "
-            f"Flowfile created: {has_flowfile}"
+            f"Flowfile created: {has_flowfile}, "
+            f"Was uploaded: {was_uploaded}"
         )
         self._write_record(record)
 
     def log_product_error(self, record: ProcessingRecord, error_type: str, error_message: str):
         """Log product processing error."""
         record.update_on_error(error_type, error_message)
-        self.logger.error(
+        self.error(
             f"Failed to process product {record.product_id}. "
             f"Error type: {error_type}, Message: {error_message}"
         )
@@ -494,14 +662,14 @@ class Logger:
 
     def log_monthly_start(self):
         """Log start of monthly processing."""
-        self.logger.info(
+        self.info(
             f"Starting processing for {self.year}-{self.month:02d}. "
             f"Run ID: {self.run_timestamp}"
         )
 
     def log_monthly_end(self, total_products: int):
         """Log end of monthly processing and write summary."""
-        self.logger.info(
+        self.info(
             f"Completed processing for {self.year}-{self.month:02d}. "
             f"Total products attempted: {total_products}"
         )
@@ -515,9 +683,11 @@ class Logger:
             writer = csv.writer(f)
             writer.writerow([
                 record.product_id,
+                record.region,
                 record.status,
                 record.error,
                 record.has_flowfile,
+                record.was_uploaded,  
                 f"{record.flood_fraction_max:.4f}",
                 record.start_time.isoformat(),
                 record.end_time.isoformat(),
@@ -541,80 +711,143 @@ class Logger:
             f"Success rate: {(successful/total*100):.1f}%\n"
         )
         
-        self.logger.info(summary)
+        self.info(summary)
 
 class Controller:
-    """Main controller with enhanced logging."""
     def __init__(self, config: Config):
         self.config = config
         self.gfm_client = GFMClient(config)
-        self.flow_processor = FlowProcessor(config.paths['hydrofabric'])
+        
+        # Initialize FlowProcessor with both hydrofabric paths
+        hydrofabric_paths = {
+            'main_hydrofabric': config.paths['main_hydrofabric'],
+            'ak_hydrofabric': config.paths['ak_hydrofabric']
+        }
+        self.flow_processor = FlowProcessor(hydrofabric_paths)
+        
         self.s3_uploader = S3Uploader(config)
+        
+        # Create necessary directories
         os.makedirs(config.paths['output'], exist_ok=True)
         os.makedirs(config.paths['temp'], exist_ok=True)
 
+        # Load region AOIs
+        self.region_aois = self._load_region_aois()
+
+    def _load_region_aois(self) -> Dict[str, List]:
+        """Load AOI coordinates for each region from the AOI directory."""
+        aois = {}
+        aoi_dir = Path("AOI")
+        if not aoi_dir.exists():
+            raise ValueError("AOI directory not found")
+
+        for region in ['conus', 'alaska', 'hawaii']:
+            aoi_file = aoi_dir / f"{region}.geojson"
+            if not aoi_file.exists():
+                continue
+            
+            try:
+                with open(aoi_file) as f:
+                    geojson = json.load(f)
+                    # Extract coordinates from GeoJSON
+                    if geojson['type'] == 'Feature':
+                        coords = geojson['geometry']['coordinates'][0]
+                    else:
+                        coords = geojson['coordinates'][0]
+                    aois[region] = coords
+            except Exception as e:
+                logging.error(f"Error loading AOI for {region}: {str(e)}")
+                continue
+
+        if not aois:
+            raise ValueError("No valid AOI files found")
+        return aois
+
     def process_monthly_data(self, year: int, month: int):
-        """Process data for a given month."""
+        """Process data for a given month for all regions."""
         self.logger = Logger(year, month)
         self.logger.log_monthly_start()
 
         try:
-            # Get date range for the month
             date_range = self._get_date_range(year, month)
-
-            # Get list of products for the month
-            products = self.gfm_client.get_products(date_range)
-            self.logger.logger.info(f"Found {len(products)} products to process")
-
-            # Process each product
-            for product_info in products:
+            all_products = []  # Keep track of all products
+            
+            # Process each region
+            for region, aoi_coords in self.region_aois.items():
                 try:
-                    self.handle_product(product_info['id'])
-                except Exception as e:
-                    self.logger.logger.error(
-                        f"Failed to process product {product_info['id']}: {str(e)}"
+                    self.logger.info(f"Processing region: {region}")
+                    
+                    # Create AOI and get its ID
+                    aoi_id = self.gfm_client._create_aoi(aoi_coords)
+                    
+                    # Get products for this region's AOI
+                    products = self.gfm_client.get_products(date_range, aoi_id)
+                    all_products.extend(products)  # Add to total products list
+                    self.logger.info(
+                        f"Found {len(products)} products for region {region}"
                     )
-                    continue  # Continue with next product even if one fails
 
-            self.logger.log_monthly_end(len(products))
+                    # Process each product using region-specific NWM data
+                    for product_info in products:
+                        try:
+                            #the gfm api includes its own "product id" but for our purposes all product_id's used by the script are the cell_code/sentinel 1 scene name.
+                            self.handle_product(product_info['cell_code'], aoi_id, region)
+                        except Exception as e:
+                            self.logger.error(
+                                f"Failed to process product {product_info['cell_code']} "
+                                f"for region {region}: {str(e)}"
+                            )
+                            continue
+
+                except Exception as e:
+                    self.logger.error(
+                        f"Failed to process region {region}: {str(e)}"
+                    )
+                    continue
+
+            self.logger.log_monthly_end(len(all_products))
 
         except Exception as e:
-            self.logger.logger.error(f"Monthly processing failed: {str(e)}")
+            self.logger.error(f"Monthly processing failed: {str(e)}")
             raise
 
-    def handle_product(self, product_id: str):
-        """Handle single product processing."""
-        record = self.logger.start_product_processing(product_id)
+    def handle_product(self, product_id: str, aoi_id: str, region: str):
+        """Handle single product processing for specific region."""
+        record = self.logger.start_product_processing(product_id, region)
         
         try:
-            # Download and process product
-            product = self.gfm_client.download_product(product_id)
+            # Download and process product using the AOI ID
+            product = self.gfm_client.download_product(product_id, aoi_id)
             
             # Calculate flood fractions
             flood_fractions = product.calculate_flood_fractions()
             
             # Create flowfile if needed
             flowfile = None
+            was_uploaded = False
+            
             if max(flood_fractions.values()) > self.config.flood_threshold:
                 scene_info = product.get_scene_info()
                 if scene_info and scene_info.get('polygon'):
                     flowfile = self.flow_processor.create_flowfile(
                         scene_info['polygon'],
-                        scene_info['datetime']
+                        scene_info['datetime'],
+                        region=region  
                     )
             
-            # Upload all files
-            self.s3_uploader.upload_product_files(
-                product.extract_path,
-                flood_fractions,
-                flowfile if flowfile is not None and not flowfile.empty else None
-            )
-            
+                # Upload all files
+                self.s3_uploader.upload_product_files(
+                    product.extract_path,
+                    flood_fractions,
+                    flowfile if flowfile is not None and not flowfile.empty else None
+                )
+                was_uploaded = True
             # Log success
             self.logger.log_product_success(
                 record,
                 flood_fractions,
-                flowfile is not None and not flowfile.empty
+                flowfile is not None and not flowfile.empty,
+                was_uploaded
             )
             
             # Clean up
@@ -630,7 +863,7 @@ class Controller:
                 try:
                     shutil.rmtree(product.extract_path)
                 except Exception as cleanup_error:
-                    self.logger.logger.error(
+                    self.logger.error(
                         f"Failed to clean up product directory: {str(cleanup_error)}"
                     )
             raise
@@ -646,10 +879,7 @@ class Controller:
         return start, end
 
 def main():
-    """Main execution function."""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='GFM Processing System')
+    parser = argparse.ArgumentParser(description='GFM Processing to obtain products that might contain flood observations and their associated flowfiles')
     parser.add_argument('--year', type=int, required=True)
     parser.add_argument('--month', type=int, required=True)
     args = parser.parse_args()
