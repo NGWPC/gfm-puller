@@ -1,5 +1,9 @@
 import pdb
+import pickle
 import argparse
+import multiprocessing
+from multiprocessing import Pool, cpu_count 
+from functools import partial
 import os
 import sys
 import json
@@ -25,6 +29,9 @@ import posixpath
 from google.cloud import storage
 import xarray as xr
 from dotenv import load_dotenv
+
+#setup nwm features so can be used across multiple processes
+shared_features = None
 
 @dataclass
 class Config:
@@ -380,43 +387,17 @@ class Product:
 class FlowProcessor:
     """Handles all flow data processing and NWM data extraction."""
     VALID_REGIONS = {'conus', 'alaska', 'hawaii'}
-    
-    def __init__(self, hydrofabric_paths: Dict[str, str]):
-        """
-        Initialize the flow processor.
-        
-        Args:
-            hydrofabric_paths: Dict containing paths to hydrofabric files
-                             ('main_hydrofabric' and 'ak_hydrofabric')
-        """
-        self.hydrofabric_paths = hydrofabric_paths
-        self.features = {}
-        
-        # Load main hydrofabric for conus and hawaii
-        print("Loading nwm features.")
-        main_features = self._load_hydrofabric(hydrofabric_paths['main_hydrofabric'])
-        self.features['conus'] = main_features
-        self.features['hawaii'] = main_features
-        
-        # Load Alaska hydrofabric
-        self.features['alaska'] = self._load_hydrofabric(hydrofabric_paths['ak_hydrofabric'])
-        print("Finished loading nwm features.")
 
-        # Initialize GCS client for NWM data
+    def __init__(self, features: Dict[str, gpd.GeoDataFrame]):
+        self.features = features
         self.gcs_client = storage.Client.create_anonymous_client()
         self.nwm_bucket = self.gcs_client.bucket("national-water-model")
 
-    def _load_hydrofabric(self, path: str) -> gpd.GeoDataFrame:
-        """Load and validate a hydrofabric file."""
-        features = gpd.read_file(path)
-        if 'ID' not in features.columns:
-            raise ValueError(f"Hydrofabric at {path} must contain 'ID' column")
-        
-        # Ensure proper CRS
-        if features.crs != "EPSG:4326":
-            features = features.to_crs("EPSG:4326")
-            
-        return features
+    @classmethod
+    def from_shared_features(cls):
+        """Create FlowProcessor using shared features."""
+        global shared_features
+        return cls(shared_features)
 
     def create_flowfile(self, polygon: Polygon, target_datetime: datetime, region: str = 'conus') -> pd.DataFrame:
         """
@@ -591,7 +572,7 @@ class Logger:
 
     def _setup_log_directory(self) -> Path:
         """Create and return log directory path."""
-        log_dir = Path(f"logs/{self.year}_{self.month:02d}_{self.run_timestamp}")
+        log_dir = Path(f"logs/processing-{self.year}_{self.month:02d}_runtime-{self.run_timestamp}")
         log_dir.mkdir(parents=True, exist_ok=True)
         return log_dir
 
@@ -712,10 +693,20 @@ class Logger:
     def _write_summary(self):
         """Write processing summary to log file."""
         total = len(self.processing_records)
+    
+        if total == 0:
+            summary = (
+                f"\nProcessing Summary\n"
+                f"=================\n"
+                f"No products were processed\n"
+            )
+            self.info(summary)
+            return
+        
         successful = sum(1 for r in self.processing_records if r.status == "success")
         failed = sum(1 for r in self.processing_records if r.status == "failed")
         with_flowfiles = sum(1 for r in self.processing_records if r.has_flowfile)
-        
+    
         summary = (
             f"\nProcessing Summary\n"
             f"=================\n"
@@ -725,29 +716,43 @@ class Logger:
             f"Products with flowfiles: {with_flowfiles}\n"
             f"Success rate: {(successful/total*100):.1f}%\n"
         )
-        
+    
         self.info(summary)
 
 class Controller:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, debug_mode: bool = False):
         self.config = config
-        self.gfm_client = GFMClient(config)
-        
-        self.s3_uploader = S3Uploader(config)
+        self.debug_mode = debug_mode 
 
-        # Initialize FlowProcessor with both hydrofabric paths
-        hydrofabric_paths = {
-            'main_hydrofabric': config.paths['main_hydrofabric'],
-            'ak_hydrofabric': config.paths['ak_hydrofabric']
-        }
-        self.flow_processor = FlowProcessor(hydrofabric_paths)
-             
         # Create necessary directories
         os.makedirs(config.paths['output'], exist_ok=True)
         os.makedirs(config.paths['temp'], exist_ok=True)
 
         # Load region AOIs
         self.region_aois = self._load_region_aois()
+
+        # Load hydrofabric features
+        self._load_hydrofabric()
+
+    def _load_hydrofabric(self):
+        """Load hydrofabric features into shared_features."""
+        global shared_features
+        print("Loading hydrofabric features...")
+        # Load main hydrofabric
+        main_features = gpd.read_file(self.config.paths['main_hydrofabric'])
+        if main_features.crs != "EPSG:4326":
+            main_features = main_features.to_crs("EPSG:4326")
+        # Load Alaska hydrofabric
+        ak_features = gpd.read_file(self.config.paths['ak_hydrofabric'])
+        if ak_features.crs != "EPSG:4326":
+            ak_features = ak_features.to_crs("EPSG:4326")
+        # Create dictionary of features
+        shared_features = {
+            'conus': main_features,
+            'hawaii': main_features,
+            'alaska': ak_features
+        }
+        print("Finished loading hydrofabric features.")
 
     def _load_region_aois(self) -> Dict[str, List]:
         """Load AOI coordinates for each region from the AOI directory."""
@@ -783,41 +788,39 @@ class Controller:
         self.logger = Logger(year, month)
         self.logger.log_monthly_start()
 
+        # Create GFM client for getting products (will not be pickled)
+        gfm_client = GFMClient(self.config)
+
+        # set number of processes for parallel mode. 
+        num_processes = 7
+
         try:
             date_range = self._get_date_range(year, month)
-            all_products = []  # Keep track of all products
-            
-            # Process each region
+            all_products = []
+    
             for region, aoi_coords in self.region_aois.items():
                 try:
                     self.logger.info(f"Processing region: {region}")
-                    
-                    # Create AOI and get its ID
-                    aoi_id = self.gfm_client._create_aoi(aoi_coords)
-                    
-                    # Get products for this region's AOI
-                    products = self.gfm_client.get_products(date_range, aoi_id)
-                    all_products.extend(products)  # Add to total products list
+                    aoi_id = gfm_client._create_aoi(aoi_coords)
+                    products = gfm_client.get_products(date_range, aoi_id)
+                    all_products.extend(products)
                     self.logger.info(
                         f"Found {len(products)} products for region {region}"
                     )
 
-                    # Process each product using region-specific NWM data
-                    for product_info in products:
-                        try:
-                            #the gfm api includes its own "product id" but for our purposes all product_id's used by the script are the cell_code/sentinel 1 scene name.
+                    if self.debug_mode:
+                        # Sequential processing for debugging
+                        for product_info in products:
                             self.handle_product(product_info['cell_code'], aoi_id, region)
-                        except Exception as e:
-                            self.logger.error(
-                                f"Failed to process product {product_info['cell_code']} "
-                                f"for region {region}: {str(e)}"
-                            )
-                            continue
+                    else:
+                        # Parallel processing
+                        process_args = [(product_info['cell_code'], aoi_id, region)
+                                        for product_info in products]
+                        with Pool(processes=num_processes) as pool:
+                            pool.starmap(self.handle_product, process_args)
 
                 except Exception as e:
-                    self.logger.error(
-                        f"Failed to process region {region}: {str(e)}"
-                    )
+                    self.logger.error(f"Failed to process region {region}: {str(e)}")
                     continue
 
             self.logger.log_monthly_end(len(all_products))
@@ -829,34 +832,43 @@ class Controller:
     def handle_product(self, product_id: str, aoi_id: str, region: str):
         """Handle single product processing for specific region."""
         record = self.logger.start_product_processing(product_id, region)
-        
+    
         try:
+            # Create new instances for this process
+            gfm_client = GFMClient(self.config)
+        
+            # Create FlowProcessor using shared hydrofabric features
+            flow_processor = FlowProcessor.from_shared_features()
+        
             # Download and process product using the AOI ID
-            product = self.gfm_client.download_product(product_id, aoi_id)
-            
+            product = gfm_client.download_product(product_id, aoi_id)
+        
             # Calculate flood fractions
             flood_fractions = product.calculate_flood_fractions()
-            
+        
             # Create flowfile if needed
             flowfile = None
             was_uploaded = False
-            
+        
             if max(flood_fractions.values()) > self.config.flood_threshold:
                 scene_info = product.get_scene_info()
                 if scene_info and scene_info.get('polygon'):
-                    flowfile = self.flow_processor.create_flowfile(
+                    flowfile = flow_processor.create_flowfile(
                         scene_info['polygon'],
                         scene_info['datetime'],
                         region=region  
                     )
-            
-                # Upload all files
-                self.s3_uploader.upload_product_files(
-                    product.extract_path,
-                    flood_fractions,
-                    flowfile if flowfile is not None and not flowfile.empty else None
-                )
-                was_uploaded = True
+        
+                    s3_uploader = S3Uploader(self.config)
+                
+                    # Upload all files
+                    s3_uploader.upload_product_files(
+                        product.extract_path,
+                        flood_fractions,
+                        flowfile if flowfile is not None and not flowfile.empty else None
+                    )
+                    was_uploaded = True
+
             # Log success
             self.logger.log_product_success(
                 record,
@@ -864,10 +876,10 @@ class Controller:
                 flowfile is not None and not flowfile.empty,
                 was_uploaded
             )
-            
+        
             # Clean up
             shutil.rmtree(product.extract_path)
-            
+        
         except Exception as e:
             self.logger.log_product_error(
                 record,
@@ -897,6 +909,7 @@ def main():
     parser = argparse.ArgumentParser(description='GFM Processing to obtain products that might contain flood observations and their associated flowfiles')
     parser.add_argument('--year', type=int, required=True)
     parser.add_argument('--month', type=int, required=True)
+    parser.add_argument('--debug', action='store_true', help='Run in debug mode (sequential processing)')
     args = parser.parse_args()
 
     config = Config.from_env()
@@ -904,6 +917,8 @@ def main():
     controller.process_monthly_data(args.year, args.month)
 
 if __name__ == "__main__":
+    # set multiprocessing start method explicitely to handle global nwm features
+    multiprocessing.set_start_method('fork')
     main()
 
 
