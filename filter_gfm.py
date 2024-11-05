@@ -81,7 +81,6 @@ class Config:
             paths={
                 'main_hydrofabric': env_vars['nwm_main_hydrofabric_path'],
                 'ak_hydrofabric': env_vars['nwm_ak_hydrofabric_path'],
-                'output': os.getenv('OUTPUT_PATH', 'output'),
                 'temp': os.getenv('TEMP_PATH', 'temp')
             }
         )
@@ -725,7 +724,6 @@ class Controller:
         self.debug_mode = debug_mode 
 
         # Create necessary directories
-        os.makedirs(config.paths['output'], exist_ok=True)
         os.makedirs(config.paths['temp'], exist_ok=True)
 
         # Load region AOIs

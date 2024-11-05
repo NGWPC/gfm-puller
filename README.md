@@ -57,9 +57,6 @@ NWM_AK_HYDROFABRIC_PATH=./hydrofabrics/nwm_flows_alaska_nwmV3_ID.gpkg
 
 # Directory for temporary file storage (default: './temp')
 TEMP_PATH=./temp
-
-# Directory for processed output files (default: './output')
-OUTPUT_PATH=./output
 ```
 
 ## Logs
