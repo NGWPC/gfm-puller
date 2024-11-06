@@ -11,6 +11,8 @@ import csv
 import logging
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
+from time import sleep
+from random import uniform
 from typing import Dict, Optional
 import pandas as pd
 import geopandas as gpd
@@ -19,6 +21,7 @@ import boto3
 import httpx
 import re  
 import urllib.request  
+import requests
 from shapely.geometry import shape, Polygon  
 from typing import List  
 import tempfile
@@ -262,17 +265,12 @@ class GFMClient:
 
     def download_product(self, product_id: str, aoi_id: str) -> 'Product':
         """
-        Download and extract a product.
-        
-        Args:
-            product_id: ID of the product to download
-            aoi_id: ID of the AOI used to query products
-        
-        Returns:
-            Path to extracted product directory
+        Download and extract a product. Need to put retry logic in here because sometimes fail to actually download file when making concurrent requests.
         """
         download_path = None
         extract_path = None
+        max_retries = 5
+    
         try:
             # Get download link
             download_response = httpx.get(
@@ -282,14 +280,42 @@ class GFMClient:
             )
             download_response.raise_for_status()
             download_link = download_response.json()['download_link']
-
+        
             # Create temp directory for this product
             extract_path = os.path.join(self.config.paths['temp'], product_id)
             os.makedirs(extract_path, exist_ok=True)
-
-            # Download the file
+        
+            # Download with retries
             download_path = os.path.join(self.config.paths['temp'], f'{product_id}.zip')
-            urllib.request.urlretrieve(download_link, download_path)
+        
+            for attempt in range(max_retries):
+                try:
+                    print(f"Process {os.getpid()} downloading {product_id} to {download_path} (Attempt {attempt + 1}/{max_retries})")
+                    urllib.request.urlretrieve(download_link, download_path)
+                    file_size = os.path.getsize(download_path)
+                    print(f"Download completed. File size: {file_size}")
+                
+                    if file_size > 0:
+                        break  # Successful download
+                    
+                    print(f"Empty file received. Retrying after delay...")
+                    if os.path.exists(download_path):
+                        os.remove(download_path)
+                    # Random delay between retries 
+                    sleep(uniform(5, 15) * (attempt + 1))
+                    
+                except Exception as download_error:
+                    print(f"Download error for {product_id} (Attempt {attempt + 1}): {str(download_error)}")
+                    if os.path.exists(download_path):
+                        os.remove(download_path)
+                    if attempt < max_retries - 1:  # Don't sleep on last attempt
+                        sleep(uniform(5, 15) * (attempt + 1))
+                    else:
+                        raise
+
+            # Verify final download
+            if not os.path.exists(download_path) or os.path.getsize(download_path) == 0:
+                raise ValueError(f"Failed to download file after {max_retries} attempts")
 
             # Extract the zip file
             with zipfile.ZipFile(download_path, 'r') as zip_ref:
@@ -722,7 +748,6 @@ class Controller:
     def __init__(self, config: Config, debug_mode: bool = False):
         self.config = config
         self.debug_mode = debug_mode 
-
         # Create necessary directories
         os.makedirs(config.paths['temp'], exist_ok=True)
 
@@ -811,6 +836,7 @@ class Controller:
                     if self.debug_mode:
                         # Sequential processing for debugging
                         for product_info in products:
+                            pdb.set_trace()
                             self.handle_product(product_info['cell_code'], aoi_id, region)
                     else:
                         # Parallel processing
@@ -913,7 +939,7 @@ def main():
     args = parser.parse_args()
 
     config = Config.from_env()
-    controller = Controller(config)
+    controller = Controller(config, args.debug)
     controller.process_monthly_data(args.year, args.month)
 
 if __name__ == "__main__":
