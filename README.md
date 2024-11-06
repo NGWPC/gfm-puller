@@ -41,7 +41,7 @@ Here is an example configuration file:
 GFM_EMAIL='EMAIL_HERE_SURROUNDED_BY_SINGLE_QUOTES'
 GFM_PASSWORD='PASSWORD_HERE_SURROUNDED_BY_SINGLE_QUOTES'
 
-# Threshold value (0-1) representing the minimum flood fraction to process a scene
+# Threshold value (0-1) representing the minimum flood to baseline ratio to process a scene
 # Example: 0.5 means 50% of reference water pixels must show flooding
 FLOOD_THRESHOLD=0.01
 
@@ -72,7 +72,9 @@ Results of this workflow can be viewed at [this confluence page](https://conflue
 ## Automation
 
 The script "run_monthly.sh" is designed to be called from cron at the 1st of the month. "run_monthly.sh" is designed run "filter_gfm.py" with the month argument set to the previous month. So for example the script run on Nov 1st, 2024 would obtain data for Oct, 2024. **Note**: The current way of obtaining credentials to the NGWPC bucket `fimc-data` that the data is currently being written to produces credentials that expire after 8hrs. This makes it impossible to sucessfully use "run_monthly.sh" in an automated way. "run_monthly.sh" is being included in the repository as an example of how one would go about automating data acquisition using longer lived AWS credentials.
+
+## Known issues
+
+* The NWM features only cover part of Alaska. If there are observations of flooded scenes in Alaska without NWM features then no flowfiles are created for those scenes.
  
 ## TODO
-
-- update all references to "flood fraction" in code and documentation to "flood ratio" or "flood to baseline ratio"

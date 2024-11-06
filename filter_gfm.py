@@ -110,20 +110,20 @@ class S3Uploader:
             print("Please check your AWS credentials and bucket configuration.")
             sys.exit(1)
 
-    def upload_product_files(self, product_path: str, flood_fractions: dict, flowfile: Optional[pd.DataFrame] = None):
+    def upload_product_files(self, product_path: str, flood_ratios: dict, flowfile: Optional[pd.DataFrame] = None):
         """
-        Upload all product files, flood fractions, and optional flowfile to S3.
+        Upload all product files, flood ratios, and optional flowfile to S3.
         
         Args:
             product_path: Path to extracted product directory
-            flood_fractions: Dictionary of flood fractions by tile
+            flood_ratios: Dictionary of flood to baseline ratios by tile
             flowfile: Optional DataFrame containing flow data
         """
         if not os.path.exists(product_path):
             raise ValueError(f"Product path does not exist: {product_path}")
         
-        if not isinstance(flood_fractions, dict):
-            raise ValueError("flood_fractions must be a dictionary")
+        if not isinstance(flood_ratios, dict):
+            raise ValueError("flood_ratios must be a dictionary")
         
         if flowfile is not None and not isinstance(flowfile, pd.DataFrame):
             raise ValueError("flowfile must be a pandas DataFrame or None")
@@ -136,10 +136,10 @@ class S3Uploader:
         base_key = self.construct_key(product_id, date_input)
         
         try:
-            # Save and upload flood fractions
-            flood_fractions_path = os.path.join(product_path, 'flood_fractions.json')
-            with open(flood_fractions_path, 'w') as f:
-                json.dump(flood_fractions, f, indent=4)
+            # Save and upload flood ratios
+            flood_ratios_path = os.path.join(product_path, 'flood_ratios.json')
+            with open(flood_ratios_path, 'w') as f:
+                json.dump(flood_ratios, f, indent=4)
             
             # Upload all files in the product directory
             for root, _, files in os.walk(product_path):
@@ -166,7 +166,6 @@ class S3Uploader:
         """Construct S3 key for product."""
         return posixpath.join(
             self.key_root,
-            f"fraction_threshold_{self.threshold}",
             date_input,
             product_id
         )
@@ -351,23 +350,31 @@ class Product:
         self.date = date
         self.extract_path = extract_path
 
-    def calculate_flood_fractions(self) -> dict:
-        """Calculate flood fractions for all tiles in the product."""
-        fractions = {}
-        
-        # Find and process all flood and reference water files
+    def calculate_flood_ratios(self) -> dict:
+        """Calculate flood ratios for all tiles in the product."""
+        ratios = {}
+    
+        # Check if any flood files exist
+        flood_files = [f for root, _, files in os.walk(self.extract_path) 
+                      for f in files if 'ENSEMBLE_FLOOD' in f and 'tif' in f]
+        if not flood_files:
+            raise ValueError(f"No flood raster files found in {self.extract_path}")
+    
+        # Process each flood file
         for root, _, files in os.walk(self.extract_path):
             for file in files:
                 if 'ENSEMBLE_FLOOD' in file and 'tif' in file:
                     tile_id = self._extract_tile_id(file)
                     flood_path = os.path.join(root, file)
                     ref_path = self._find_reference_file(root, tile_id)
-                    
-                    if ref_path:
-                        fraction = self._calculate_tile_fraction(flood_path, ref_path)
-                        fractions[tile_id] = fraction
-        
-        return fractions
+                
+                    if not ref_path:
+                        raise ValueError(f"No reference water raster found for tile {tile_id}")
+                
+                    ratio = self._calculate_tile_ratio(flood_path, ref_path)
+                    ratios[tile_id] = ratio
+    
+        return ratios
 
     def get_scene_info(self) -> dict:
         """Get scene polygon and datetime."""
@@ -398,8 +405,8 @@ class Product:
         return str(matches[0]) if matches else None
 
     @staticmethod
-    def _calculate_tile_fraction(flood_path: str, ref_path: str) -> float:
-        """Calculate flood fraction for a single tile."""
+    def _calculate_tile_ratio(flood_path: str, ref_path: str) -> float:
+        """Calculate flood ratio for a single tile."""
         with rasterio.open(flood_path) as flood_ds, rasterio.open(ref_path) as ref_ds:
             flood_data = flood_ds.read(1)
             ref_data = ref_ds.read(1)
@@ -441,15 +448,13 @@ class FlowProcessor:
         # Get features in polygon using region-specific hydrofabric
         feature_ids = self.get_features_in_polygon(polygon, region)
         if not feature_ids:
-            logging.warning(f"No features found in polygon for region {region}")
-            return pd.DataFrame(columns=['feature_id', 'streamflow'])
+            raise ValueError(f"No NWM features found in scene polygon for region {region}")
 
         # Get flow data for features
         flow_data = self.get_flow_data(target_datetime, region)
         
         if flow_data is None:
-            logging.warning(f"No flow data found for datetime in region {region}")
-            return pd.DataFrame(columns=['feature_id', 'streamflow'])
+            raise ValueError(f"No NWM flow data found for datetime in region {region}")
 
         # Filter flow data to features in polygon
         return flow_data[flow_data['feature_id'].isin(feature_ids)]
@@ -566,7 +571,7 @@ class ProcessingRecord:
     error: str = ""
     has_flowfile: bool = False
     was_uploaded: bool = False
-    flood_fraction_max: float = 0.0
+    flood_ratio_max: float = 0.0
     end_time: datetime = field(default_factory=datetime.now)
 
     def update_on_error(self, error_type: str, error_message: str):
@@ -576,13 +581,13 @@ class ProcessingRecord:
         self.status = "failed"
         self.error = error_message
 
-    def update_on_success(self, flood_fractions: dict, has_flowfile: bool, was_uploaded: bool):  
+    def update_on_success(self, flood_ratios: dict, has_flowfile: bool, was_uploaded: bool):  
         """Update record when processing succeeds."""
         self.end_time = datetime.now()
         self.status = "success"
         self.has_flowfile = has_flowfile
         self.was_uploaded = was_uploaded
-        self.flood_fraction_max = max(flood_fractions.values(), default=0.0)
+        self.flood_ratio_max = max(flood_ratios.values(), default=0.0)
 
 class Logger:
     """Enhanced logging class with both file and CSV logging."""
@@ -645,7 +650,7 @@ class Logger:
                 "error",
                 "has_flowfile",
                 "was_uploaded",
-                "max_flood_fraction",
+                "max_flood_ratio",
                 "start_time",
                 "end_time",
                 "processing_duration_seconds"
@@ -661,12 +666,12 @@ class Logger:
         self.info(f"Starting processing of product: {product_id}")
         return record
 
-    def log_product_success(self, record: ProcessingRecord, flood_fractions: dict, has_flowfile: bool, was_uploaded: bool):
+    def log_product_success(self, record: ProcessingRecord, flood_ratios: dict, has_flowfile: bool, was_uploaded: bool):
         """Log successful product processing."""
-        record.update_on_success(flood_fractions, has_flowfile, was_uploaded)
+        record.update_on_success(flood_ratios, has_flowfile, was_uploaded)
         self.info(
             f"Successfully processed product {record.product_id}. "
-            f"Max flood fraction: {record.flood_fraction_max:.2%}, "
+            f"Max flood ratio: {record.flood_ratio_max:.2%}, "
             f"Flowfile created: {has_flowfile}, "
             f"Was uploaded: {was_uploaded}"
         )
@@ -694,7 +699,6 @@ class Logger:
             f"Completed processing for {self.year}-{self.month:02d}. "
             f"Total products attempted: {total_products}"
         )
-        self._write_summary()
 
     def _write_record(self, record: ProcessingRecord):
         """Write a processing record to CSV."""
@@ -709,40 +713,11 @@ class Logger:
                 record.error,
                 record.has_flowfile,
                 record.was_uploaded,  
-                f"{record.flood_fraction_max:.4f}",
+                f"{record.flood_ratio_max:.4f}",
                 record.start_time.isoformat(),
                 record.end_time.isoformat(),
                 f"{duration:.1f}"
             ])
-
-    def _write_summary(self):
-        """Write processing summary to log file."""
-        total = len(self.processing_records)
-    
-        if total == 0:
-            summary = (
-                f"\nProcessing Summary\n"
-                f"=================\n"
-                f"No products were processed\n"
-            )
-            self.info(summary)
-            return
-        
-        successful = sum(1 for r in self.processing_records if r.status == "success")
-        failed = sum(1 for r in self.processing_records if r.status == "failed")
-        with_flowfiles = sum(1 for r in self.processing_records if r.has_flowfile)
-    
-        summary = (
-            f"\nProcessing Summary\n"
-            f"=================\n"
-            f"Total products processed: {total}\n"
-            f"Successful: {successful}\n"
-            f"Failed: {failed}\n"
-            f"Products with flowfiles: {with_flowfiles}\n"
-            f"Success rate: {(successful/total*100):.1f}%\n"
-        )
-    
-        self.info(summary)
 
 class Controller:
     def __init__(self, config: Config, debug_mode: bool = False):
@@ -869,14 +844,14 @@ class Controller:
             # Download and process product using the AOI ID
             product = gfm_client.download_product(product_id, aoi_id)
         
-            # Calculate flood fractions
-            flood_fractions = product.calculate_flood_fractions()
+            # Calculate flood ratios
+            flood_ratios = product.calculate_flood_ratios()
         
             # Create flowfile if needed
             flowfile = None
             was_uploaded = False
         
-            if max(flood_fractions.values()) > self.config.flood_threshold:
+            if max(flood_ratios.values(), default=0.0) > self.config.flood_threshold:
                 scene_info = product.get_scene_info()
                 if scene_info and scene_info.get('polygon'):
                     flowfile = flow_processor.create_flowfile(
@@ -890,7 +865,7 @@ class Controller:
                     # Upload all files
                     s3_uploader.upload_product_files(
                         product.extract_path,
-                        flood_fractions,
+                        flood_ratios,
                         flowfile if flowfile is not None and not flowfile.empty else None
                     )
                     was_uploaded = True
@@ -898,7 +873,7 @@ class Controller:
             # Log success
             self.logger.log_product_success(
                 record,
-                flood_fractions,
+                flood_ratios,
                 flowfile is not None and not flowfile.empty,
                 was_uploaded
             )
