@@ -236,11 +236,25 @@ class GFMClient:
         return products_response.json().get('products', [])
 
     def _create_aoi(self, coordinates: list) -> str:
+        """
+        Create AOI.
+    
+        Args:
+            coordinates: List of coordinates forming polygon
+        
+        Returns:
+            str: AOI ID
+        
+        Raises:
+            Exception: If AOI creation fails after all retries
+        """
         if not coordinates:
             raise ValueError("Empty coordinates provided")
-        
+    
         coords_to_use = [coordinates]
-
+        max_retries = 2
+        last_exception = None
+    
         aoi_params = {
             "aoi_name": "Example AOI",
             "description": "An example region of interest",
@@ -252,15 +266,29 @@ class GFMClient:
             "skip_aoi_check": "false"
         }
 
-        aoi_response = httpx.post(
-            f'{self.host}/aoi/create',
-            headers=self.headers,
-            json=aoi_params,
-            timeout=600
-        )
-        aoi_response.raise_for_status()
-        
-        return aoi_response.json()['aoi_id']
+        for attempt in range(max_retries + 1):  # +1 for initial attempt
+            try:
+                aoi_response = httpx.post(
+                    f'{self.host}/aoi/create',
+                    headers=self.headers,
+                    json=aoi_params,
+                    timeout=600
+                )
+                aoi_response.raise_for_status()
+                return aoi_response.json()['aoi_id']
+            
+            except Exception as e:
+                last_exception = e
+                if attempt < max_retries:
+                    # Calculate delay with exponential backoff
+                    delay = (2 ** attempt) * uniform(1, 2)  # Random delay between 1-2, 2-4, 4-8 seconds
+                    sleep(delay)
+                    logging.warning(f"AOI creation attempt {attempt + 1} failed. Retrying after {delay:.1f} seconds. Error: {str(e)}")
+                    continue
+    
+        # If we get here, all retries failed
+        logging.error(f"AOI creation failed after {max_retries + 1} attempts")
+        raise last_exception
 
     def download_product(self, product_id: str, aoi_id: str) -> 'Product':
         """
@@ -275,7 +303,7 @@ class GFMClient:
             download_response = httpx.get(
                 f'{self.host}/download/scene-product/{product_id}/{aoi_id}',
                 headers=self.headers,
-                timeout=600
+                timeout=1200
             )
             download_response.raise_for_status()
             download_link = download_response.json()['download_link']
@@ -322,7 +350,6 @@ class GFMClient:
 
             # Clean up zip file
             os.remove(download_path)
-
             return Product(
                 id=product_id,
                 date=self._parse_date_from_product_id(product_id),
@@ -369,6 +396,7 @@ class Product:
                     ref_path = self._find_reference_file(root, tile_id)
                 
                     if not ref_path:
+                        pdb.set_trace()
                         raise ValueError(f"No reference water raster found for tile {tile_id}")
                 
                     ratio = self._calculate_tile_ratio(flood_path, ref_path)
@@ -395,13 +423,28 @@ class Product:
     @staticmethod
     def _extract_tile_id(filename: str) -> str:
         """Extract tile ID from filename."""
-        match = re.search(r'_(\w+)_ENSEMBLE_FLOOD_', filename)
+        match = re.search(r'_([E]\d{3}[N]\d{3}T\d)_ENSEMBLE_FLOOD_', filename)
+        if not match:
+            # Try second pattern: ID near end of filename
+            match = re.search(r'_([E]\d{3}[N]\d{3}T\d)_\d{8}\.', filename)
+            if not match:
+                pdb.set_trace()
         return match.group(1) if match else None
 
     def _find_reference_file(self, root: str, tile_id: str) -> Optional[str]:
         """Find reference water file for given tile ID."""
-        pattern = f"*{tile_id}_REFERENCE_WATER_OUT_*.tif"
-        matches = list(Path(root).glob(pattern))
+        pattern1 = f"*{tile_id}_REFERENCE_WATER_OUT_*.tif"
+        # Pattern 2: Files starting with REFERENCE_WATER_OUT containing tile_id
+        pattern2 = f"REFERENCE_WATER_OUT_*{tile_id}*.tif"
+        pattern3 = "REFERENCE_WATER_OUT_*_------_*.tif"
+    
+        matches = list(Path(root).glob(pattern1))
+        if not matches:
+            matches = list(Path(root).glob(pattern2))
+   
+        if not matches:
+            matches = list(Path(root).glob(pattern3))
+
         return str(matches[0]) if matches else None
 
     @staticmethod
@@ -811,16 +854,32 @@ class Controller:
                     if self.debug_mode:
                         # Sequential processing for debugging
                         for product_info in products:
-                            pdb.set_trace()
-                            self.handle_product(product_info['cell_code'], aoi_id, region)
+                            try:
+                                self.handle_product(product_info['cell_code'], aoi_id, region)
+                            except Exception as e:
+                                self.logger.error(f"Failed to process product {product_info['cell_code']}: {str(e)}")
+                                # Continue with next product
+                                continue
                     else:
                         # Parallel processing
                         process_args = [(product_info['cell_code'], aoi_id, region)
-                                        for product_info in products]
+                                      for product_info in products]
                         with Pool(processes=num_processes) as pool:
-                            pool.starmap(self.handle_product, process_args)
+                            # Use starmap_async to prevent exceptions from stopping other processes
+                            results = [pool.apply_async(self.handle_product, args) 
+                                     for args in process_args]
+                            
+                            # Wait for all processes and collect any errors
+                            for result, (product_id, _, _) in zip(results, process_args):
+                                try:
+                                    result.get()
+                                except Exception as e:
+                                    self.logger.error(f"Failed to process product {product_id}: {str(e)}")
+                                    # Continue with next product
+                                    continue
 
                 except Exception as e:
+                    pdb.set_trace()
                     self.logger.error(f"Failed to process region {region}: {str(e)}")
                     continue
 
@@ -844,8 +903,20 @@ class Controller:
             # Download and process product using the AOI ID
             product = gfm_client.download_product(product_id, aoi_id)
         
-            # Calculate flood ratios
-            flood_ratios = product.calculate_flood_ratios()
+            try:
+                # Calculate flood ratios
+                flood_ratios = product.calculate_flood_ratios()
+            except ValueError as e:
+                if "No reference water raster found" in str(e):
+                    self.logger.log_product_error(
+                        record,
+                        error_type="NoReferenceWaterError",
+                        error_message=str(e)
+                    )
+                    if hasattr(product, 'extract_path'):
+                        shutil.rmtree(product.extract_path)
+                    return  # Exit the function but don't raise the exception
+                raise  # Re-raise other ValueError exceptions
         
             # Create flowfile if needed
             flowfile = None
@@ -894,7 +965,6 @@ class Controller:
                     self.logger.error(
                         f"Failed to clean up product directory: {str(cleanup_error)}"
                     )
-            raise
 
     @staticmethod
     def _get_date_range(year: int, month: int) -> tuple:
