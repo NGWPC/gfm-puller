@@ -446,7 +446,7 @@ class Product:
             # Try second pattern: ID near end of filename
             match = re.search(r'_([E]\d{3}[N]\d{3}T\d)_\d{8}\.', filename)
             if not match:
-                pdb.set_trace()
+                print(f"\n\nOops trouble finding a tile id in filename: {filename}\n\n")
         return match.group(1) if match else None
 
     def _find_reference_file(self, root: str, tile_id: str) -> Optional[str]:
@@ -495,34 +495,42 @@ class FlowProcessor:
     def create_flowfile(self, polygon: Polygon, target_datetime: datetime, region: str = 'conus') -> tuple[Optional[pd.DataFrame], Optional[str]]:
         """
         Create flowfile for a given polygon and datetime.
-        
+    
         Args:
             polygon: Shapely polygon of the area of interest
             target_datetime: Target datetime for flow data
-        
+    
         Returns:
             Tuple of (DataFrame with feature_id and streamflow columns, NWM version number)
+            or (None, None) if no data found
         """
         if region not in self.VALID_REGIONS:
             raise ValueError(f"Invalid region. Must be one of {self.VALID_REGIONS}")
-            
-        # Get features in polygon using region-specific hydrofabric
-        feature_ids = self.get_features_in_polygon(polygon, region)
-        if not feature_ids:
-            raise ValueError(f"No NWM features found in scene polygon for region {region}")
+        
+        try:
+            # Get features in polygon using region-specific hydrofabric
+            feature_ids = self.get_features_in_polygon(polygon, region)
+            if not feature_ids:
+                logging.warning(f"No NWM features found in scene polygon for region {region}")
+                return None, None
 
-        # Get flow data for features
-        flow_data_result = self.get_flow_data(target_datetime, region)
+            # Get flow data for features
+            flow_data_result = self.get_flow_data(target_datetime, region)
         
-        if flow_data_result is None:
-            raise ValueError(f"No NWM flow data found for datetime in region {region}")
+            if flow_data_result is None:
+                logging.warning(f"No NWM flow data found for datetime in region {region}")
+                return None, None
 
-        flow_data, nwm_version = flow_data_result
+            flow_data, nwm_version = flow_data_result
         
-        # Filter flow data to features in polygon
-        filtered_flow_data = flow_data[flow_data['feature_id'].isin(feature_ids)]
+            # Filter flow data to features in polygon
+            filtered_flow_data = flow_data[flow_data['feature_id'].isin(feature_ids)]
         
-        return filtered_flow_data, nwm_version
+            return filtered_flow_data, nwm_version
+        
+        except Exception as e:
+            logging.error(f"Error creating flowfile: {str(e)}")
+            return None, None
 
     def get_features_in_polygon(self, polygon: Polygon, region: str) -> List[str]:
         """Get feature IDs that intersect with or are within the polygon."""
@@ -918,17 +926,17 @@ class Controller:
     def handle_product(self, product_id: str, aoi_id: str, region: str):
         """Handle single product processing for specific region."""
         record = self.logger.start_product_processing(product_id, region)
-    
+
         try:
             # Create new instances for this process
             gfm_client = GFMClient(self.config)
-        
+    
             # Create FlowProcessor using shared hydrofabric features
             flow_processor = FlowProcessor.from_shared_features()
-        
+    
             # Download and process product using the AOI ID
             product = gfm_client.download_product(product_id, aoi_id)
-        
+    
             try:
                 # Calculate flood ratios
                 flood_ratios = product.calculate_flood_ratios()
@@ -943,27 +951,31 @@ class Controller:
                         shutil.rmtree(product.extract_path)
                     return  # Exit the function but don't raise the exception
                 raise  # Re-raise other ValueError exceptions
-        
+    
             # Create flowfile if needed
-            flowfile = None
+            flowfile_data = None
             was_uploaded = False
-        
+    
             if max(flood_ratios.values(), default=0.0) > self.config.flood_threshold:
                 scene_info = product.get_scene_info()
                 if scene_info and scene_info.get('polygon'):
-                    flowfile = flow_processor.create_flowfile(
+                    flow_df, nwm_version = flow_processor.create_flowfile(
                         scene_info['polygon'],
                         scene_info['datetime'],
                         region=region  
                     )
-        
-                    s3_uploader = S3Uploader(self.config)
                 
+                    # Only create flowfile tuple if we have data
+                    if flow_df is not None and nwm_version is not None:
+                        flowfile_data = (flow_df, nwm_version)
+    
+                    s3_uploader = S3Uploader(self.config)
+            
                     # Upload all files
                     s3_uploader.upload_product_files(
                         product.extract_path,
                         flood_ratios,
-                        flowfile if flowfile is not None and not flowfile.empty else None
+                        flowfile_data
                     )
                     was_uploaded = True
 
@@ -971,13 +983,13 @@ class Controller:
             self.logger.log_product_success(
                 record,
                 flood_ratios,
-                flowfile is not None and not flowfile.empty,
+                flowfile_data is not None,  # Check if we have flowfile data
                 was_uploaded
             )
-        
+    
             # Clean up
             shutil.rmtree(product.extract_path)
-        
+    
         except Exception as e:
             self.logger.log_product_error(
                 record,
