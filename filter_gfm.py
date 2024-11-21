@@ -110,23 +110,20 @@ class S3Uploader:
             print("Please check your AWS credentials and bucket configuration.")
             sys.exit(1)
 
-    def upload_product_files(self, product_path: str, flood_ratios: dict, flowfile: Optional[pd.DataFrame] = None):
+    def upload_product_files(self, product_path: str, flood_ratios: dict, flowfile_info: Optional[tuple[pd.DataFrame, str]] = None):
         """
         Upload all product files, flood ratios, and optional flowfile to S3.
         
         Args:
             product_path: Path to extracted product directory
             flood_ratios: Dictionary of flood to baseline ratios by tile
-            flowfile: Optional DataFrame containing flow data
+            flowfile_info: Optional tuple of (DataFrame containing flow data, NWM version)
         """
         if not os.path.exists(product_path):
             raise ValueError(f"Product path does not exist: {product_path}")
         
         if not isinstance(flood_ratios, dict):
             raise ValueError("flood_ratios must be a dictionary")
-        
-        if flowfile is not None and not isinstance(flowfile, pd.DataFrame):
-            raise ValueError("flowfile must be a pandas DataFrame or None")
 
         # Get product ID and date from path
         product_id = os.path.basename(product_path)
@@ -152,10 +149,15 @@ class S3Uploader:
                     self.s3_client.upload_file(file_path, self.bucket, s3_key)
             
             # Upload flowfile if provided
-            if flowfile is not None:
-                flowfile_path = os.path.join(product_path, 'flowfile.csv')
+            if flowfile_info is not None:
+                flowfile, nwm_version = flowfile_info
+                if not isinstance(flowfile, pd.DataFrame):
+                    raise ValueError("flowfile must be a pandas DataFrame")
+                    
+                filename = f"NWM_{nwm_version}_flowfile.csv"
+                flowfile_path = os.path.join(product_path, filename)
                 flowfile.to_csv(flowfile_path, index=False)
-                s3_key = posixpath.join(base_key, 'flowfile.csv')
+                s3_key = posixpath.join(base_key, filename)
                 self.s3_client.upload_file(flowfile_path, self.bucket, s3_key)
 
         except Exception as e:
@@ -380,13 +382,13 @@ class Product:
     def calculate_flood_ratios(self) -> dict:
         """Calculate flood ratios for all tiles in the product."""
         ratios = {}
-    
+
         # Check if any flood files exist
         flood_files = [f for root, _, files in os.walk(self.extract_path) 
                       for f in files if 'ENSEMBLE_FLOOD' in f and 'tif' in f]
         if not flood_files:
             raise ValueError(f"No flood raster files found in {self.extract_path}")
-    
+
         # Process each flood file
         for root, _, files in os.walk(self.extract_path):
             for file in files:
@@ -394,14 +396,30 @@ class Product:
                     tile_id = self._extract_tile_id(file)
                     flood_path = os.path.join(root, file)
                     ref_path = self._find_reference_file(root, tile_id)
-                
+            
                     if not ref_path:
-                        pdb.set_trace()
+                        # Get all files in the extract path
+                        all_files = []
+                        for r, _, fs in os.walk(self.extract_path):
+                            all_files.extend(fs)
+                    
+                        print(f"\nDebug information for tile {tile_id}:")
+                        print("\nFiles with 'flood' in them:")
+                        for f in [f for f in all_files if 'flood' in f.lower()]:
+                            print(f"  {f}")
+                        print("\nFiles with 'reference' in them:")
+                        for f in [f for f in all_files if 'reference' in f.lower()]:
+                            print(f"  {f}")
+                        print("\nFiles with 'obswater' in them:")
+                        for f in [f for f in all_files if 'obswater' in f.lower()]:
+                            print(f"  {f}")
+                        print("\n")
+                    
                         raise ValueError(f"No reference water raster found for tile {tile_id}")
-                
+            
                     ratio = self._calculate_tile_ratio(flood_path, ref_path)
                     ratios[tile_id] = ratio
-    
+
         return ratios
 
     def get_scene_info(self) -> dict:
@@ -474,7 +492,7 @@ class FlowProcessor:
         global shared_features
         return cls(shared_features)
 
-    def create_flowfile(self, polygon: Polygon, target_datetime: datetime, region: str = 'conus') -> pd.DataFrame:
+    def create_flowfile(self, polygon: Polygon, target_datetime: datetime, region: str = 'conus') -> tuple[Optional[pd.DataFrame], Optional[str]]:
         """
         Create flowfile for a given polygon and datetime.
         
@@ -483,7 +501,7 @@ class FlowProcessor:
             target_datetime: Target datetime for flow data
         
         Returns:
-            DataFrame with feature_id and streamflow columns
+            Tuple of (DataFrame with feature_id and streamflow columns, NWM version number)
         """
         if region not in self.VALID_REGIONS:
             raise ValueError(f"Invalid region. Must be one of {self.VALID_REGIONS}")
@@ -494,13 +512,17 @@ class FlowProcessor:
             raise ValueError(f"No NWM features found in scene polygon for region {region}")
 
         # Get flow data for features
-        flow_data = self.get_flow_data(target_datetime, region)
+        flow_data_result = self.get_flow_data(target_datetime, region)
         
-        if flow_data is None:
+        if flow_data_result is None:
             raise ValueError(f"No NWM flow data found for datetime in region {region}")
 
+        flow_data, nwm_version = flow_data_result
+        
         # Filter flow data to features in polygon
-        return flow_data[flow_data['feature_id'].isin(feature_ids)]
+        filtered_flow_data = flow_data[flow_data['feature_id'].isin(feature_ids)]
+        
+        return filtered_flow_data, nwm_version
 
     def get_features_in_polygon(self, polygon: Polygon, region: str) -> List[str]:
         """Get feature IDs that intersect with or are within the polygon."""
@@ -511,7 +533,7 @@ class FlowProcessor:
         mask = features.intersects(polygon) | features.within(polygon)
         return features[mask]['ID'].tolist()
 
-    def get_flow_data(self, target_datetime: datetime, region: str = 'conus') -> Optional[pd.DataFrame]:
+    def get_flow_data(self, target_datetime: datetime, region: str = 'conus') -> Optional[tuple[pd.DataFrame, str]]:
         """
         Get NWM flow data for a specific datetime and region.
         
@@ -520,7 +542,8 @@ class FlowProcessor:
             region: 'conus', 'alaska', or 'hawaii'
         
         Returns:
-            DataFrame with feature_id and streamflow columns
+            Tuple of (DataFrame with feature_id and streamflow columns, NWM version number)
+            or None if no data found
         """
         # Get closest hour
         closest_hour = self._get_closest_hour(target_datetime)
@@ -542,13 +565,16 @@ class FlowProcessor:
                 
                 # Open NetCDF file
                 with xr.open_dataset(temp_file.name) as ds:
+                    # Extract NWM version number
+                    nwm_version = str(ds.attrs.get('NWM_version_number', 'version_unknown'))
+                    
                     # Extract feature_id and streamflow
                     df = pd.DataFrame({
                         'feature_id': ds['feature_id'].values,
                         'streamflow': ds['streamflow'].values
                     })
                     
-                    return df
+                    return df, nwm_version
 
         except Exception as e:
             logging.error(f"Error processing NWM data: {str(e)}")
