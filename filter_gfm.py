@@ -294,64 +294,141 @@ class GFMClient:
 
     def download_product(self, product_id: str, aoi_id: str) -> 'Product':
         """
-        Download and extract a product. Need to put retry logic in here because sometimes fail to actually download file when making concurrent requests.
+        Download and extract a product with enhanced error handling and timeout handling.
+    
+        Args:
+            product_id: ID of the product to download
+            aoi_id: ID of the AOI
+        
+        Returns:
+            Product object
+        
+        Raises:
+            ValueError: If download link is invalid or download fails
+            RuntimeError: If extraction fails
         """
         download_path = None
         extract_path = None
         max_retries = 5
     
+        # Longer timeouts for large files
+        CONNECT_TIMEOUT = 160    # seconds to establish connection
+        READ_TIMEOUT = 1800    # 30 minutes to download file
+
         try:
-            # Get download link
-            download_response = httpx.get(
-                f'{self.host}/download/scene-product/{product_id}/{aoi_id}',
-                headers=self.headers,
-                timeout=1200
-            )
-            download_response.raise_for_status()
-            download_link = download_response.json()['download_link']
-        
+            # Get download link with retry
+            download_link = None
+            for attempt in range(max_retries):
+                try:
+                    download_response = httpx.get(
+                        f'{self.host}/download/scene-product/{product_id}/{aoi_id}',
+                        headers=self.headers,
+                        timeout=1200  
+                    )
+                    download_response.raise_for_status()
+                    download_link = download_response.json().get('download_link')
+                
+                    if not download_link:
+                        raise ValueError("Received empty download link")
+                    
+                    break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise ValueError(f"Failed to get download link after {max_retries} attempts: {str(e)}")
+                    sleep(uniform(5, 15) * (attempt + 1))
+                    continue
+    
             # Create temp directory for this product
             extract_path = os.path.join(self.config.paths['temp'], product_id)
             os.makedirs(extract_path, exist_ok=True)
-        
+    
             # Download with retries
             download_path = os.path.join(self.config.paths['temp'], f'{product_id}.zip')
-        
+    
             for attempt in range(max_retries):
                 try:
                     print(f"Process {os.getpid()} downloading {product_id} to {download_path} (Attempt {attempt + 1}/{max_retries})")
-                    urllib.request.urlretrieve(download_link, download_path)
-                    file_size = os.path.getsize(download_path)
-                    print(f"Download completed. File size: {file_size}")
                 
-                    if file_size > 0:
-                        break  # Successful download
+                    # Create a session with custom timeout settings
+                    session = requests.Session()
+                    session.mount('https://', requests.adapters.HTTPAdapter(
+                        max_retries=3,
+                        pool_connections=10,
+                        pool_maxsize=10
+                    ))
+                
+                    # Stream the response with increased timeouts
+                    response = session.get(
+                        download_link, 
+                        stream=True,
+                        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
+                    )
+                    response.raise_for_status()
+                
+                    # Get total file size if available
+                    total_size = int(response.headers.get('content-length', 0))
+                
+                    # Open file in binary write mode
+                    with open(download_path, 'wb') as f:
+                        if total_size == 0:  # No content length header
+                            f.write(response.content)
+                        else:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                
+                    # Verify the download
+                    if not os.path.exists(download_path):
+                        raise ValueError("Download file not created")
                     
-                    print(f"Empty file received. Retrying after delay...")
+                    file_size = os.path.getsize(download_path)
+                    if file_size == 0:
+                        raise ValueError("Downloaded file is empty")
+                    
+                    if total_size > 0 and file_size != total_size:
+                        raise ValueError(f"Incomplete download: got {file_size} bytes, expected {total_size}")
+                
+                    print(f"Download completed for {product_id}. File size: {file_size}")
+                    break
+                
+                except requests.Timeout as timeout_error:
+                    print(f"Timeout error for {product_id} (Attempt {attempt + 1}): {str(timeout_error)}")
                     if os.path.exists(download_path):
                         os.remove(download_path)
-                    # Random delay between retries 
-                    sleep(uniform(5, 15) * (attempt + 1))
-                    
+                    if attempt < max_retries - 1:
+                        # Increase timeout for next attempt
+                        READ_TIMEOUT *= 1.5
+                        sleep(uniform(10, 30) * (attempt + 1))
+                    else:
+                        raise ValueError(f"Failed to download after {max_retries} attempts due to timeouts")
+            
                 except Exception as download_error:
                     print(f"Download error for {product_id} (Attempt {attempt + 1}): {str(download_error)}")
                     if os.path.exists(download_path):
                         os.remove(download_path)
-                    if attempt < max_retries - 1:  # Don't sleep on last attempt
-                        sleep(uniform(5, 15) * (attempt + 1))
+                    if attempt < max_retries - 1:
+                        sleep(uniform(10, 30) * (attempt + 1))
                     else:
-                        raise
+                        raise ValueError(f"Failed to download after {max_retries} attempts: {str(download_error)}")
 
-            # Verify final download
-            if not os.path.exists(download_path) or os.path.getsize(download_path) == 0:
-                raise ValueError(f"Failed to download file after {max_retries} attempts")
-
-            # Extract the zip file
-            with zipfile.ZipFile(download_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_path)
+            # Verify zip file integrity before extraction
+            try:
+                with zipfile.ZipFile(download_path, 'r') as zip_ref:
+                    # Test zip file integrity
+                    if zip_ref.testzip() is not None:
+                        raise zipfile.BadZipFile("Zip file is corrupted")
+                    # Extract the zip file
+                    zip_ref.extractall(extract_path)
+            except zipfile.BadZipFile as e:
+                raise RuntimeError(f"Invalid or corrupted zip file: {str(e)}")
 
             # Clean up zip file
             os.remove(download_path)
+        
+            # Verify extraction succeeded
+            if not os.path.exists(extract_path) or not os.listdir(extract_path):
+                raise RuntimeError("Extraction produced no files")
+
             return Product(
                 id=product_id,
                 date=self._parse_date_from_product_id(product_id),
@@ -359,12 +436,12 @@ class GFMClient:
             )
 
         except Exception as e:
-            logging.error(f"Failed to download product {product_id}: {str(e)}")
-            if os.path.exists(download_path):
+            # Clean up any partial downloads/extractions
+            if download_path and os.path.exists(download_path):
                 os.remove(download_path)
-            if os.path.exists(extract_path):
+            if extract_path and os.path.exists(extract_path):
                 shutil.rmtree(extract_path)
-            raise
+            raise RuntimeError(f"Failed to process product {product_id}: {str(e)}") from e
 
     @staticmethod
     def _parse_date_from_product_id(product_id: str) -> datetime:
@@ -395,32 +472,67 @@ class Product:
                 if 'ENSEMBLE_FLOOD' in file and 'tif' in file:
                     tile_id = self._extract_tile_id(file)
                     flood_path = os.path.join(root, file)
+                    
+                    # First try to find reference water file
                     ref_path = self._find_reference_file(root, tile_id)
-            
-                    if not ref_path:
-                        # Get all files in the extract path
-                        all_files = []
-                        for r, _, fs in os.walk(self.extract_path):
-                            all_files.extend(fs)
                     
-                        print(f"\nDebug information for tile {tile_id}:")
-                        print("\nFiles with 'flood' in them:")
-                        for f in [f for f in all_files if 'flood' in f.lower()]:
-                            print(f"  {f}")
-                        print("\nFiles with 'reference' in them:")
-                        for f in [f for f in all_files if 'reference' in f.lower()]:
-                            print(f"  {f}")
-                        print("\nFiles with 'obswater' in them:")
-                        for f in [f for f in all_files if 'obswater' in f.lower()]:
-                            print(f"  {f}")
-                        print("\n")
+                    if ref_path:
+                        # Use traditional reference water method
+                        ratio = self._calculate_tile_ratio(flood_path, ref_path)
+                    else:
+                        # Try to derive reference water from OBSWATER
+                        obswater_path = self._find_obswater_file(root, tile_id)
+                        if not obswater_path:
+                            # Get all files in the extract path for debugging
+                            all_files = []
+                            for r, _, fs in os.walk(self.extract_path):
+                                all_files.extend(fs)
+                            
+                            print(f"\nDebug information for tile {tile_id}:")
+                            print("\nFiles with 'flood' in them:")
+                            for f in [f for f in all_files if 'flood' in f.lower()]:
+                                print(f"  {f}")
+                            print("\nFiles with 'reference' in them:")
+                            for f in [f for f in all_files if 'reference' in f.lower()]:
+                                print(f"  {f}")
+                            print("\nFiles with 'obswater' in them:")
+                            for f in [f for f in all_files if 'obswater' in f.lower()]:
+                                print(f"  {f}")
+                            print("\n")
+                            
+                            raise ValueError(f"Neither reference water nor obswater raster found for tile {tile_id}")
+                        
+                        ratio = self._calculate_tile_ratio_from_obswater(flood_path, obswater_path)
                     
-                        raise ValueError(f"No reference water raster found for tile {tile_id}")
-            
-                    ratio = self._calculate_tile_ratio(flood_path, ref_path)
                     ratios[tile_id] = ratio
 
         return ratios
+
+    def _find_obswater_file(self, root: str, tile_id: str) -> Optional[str]:
+        """Find OBSWATER file for given tile ID."""
+        pattern = f"*{tile_id}_ENSEMBLE_OBSWATER_*.tif"
+        matches = list(Path(root).glob(pattern))
+        return str(matches[0]) if matches else None
+
+    def _calculate_tile_ratio_from_obswater(self, flood_path: str, obswater_path: str) -> float:
+        """
+        Calculate flood ratio using OBSWATER raster when reference water is not available.
+        
+        The reference water is derived by masking out flood pixels from the OBSWATER raster.
+        """
+        with rasterio.open(flood_path) as flood_ds, rasterio.open(obswater_path) as obs_ds:
+            flood_data = flood_ds.read(1)
+            obs_data = obs_ds.read(1)
+            
+            # Create reference water mask by removing flood pixels from obswater
+            ref_data = obs_data.copy()
+            ref_data[flood_data != 0] = 0  # Mask out flood pixels
+            
+            # Calculate ratios
+            flood_pixels = (flood_data == 1).sum()
+            ref_pixels = (ref_data == 1).sum()  # Count only definite water pixels
+            
+            return flood_pixels / ref_pixels if ref_pixels > 0 else 0.0
 
     def get_scene_info(self) -> dict:
         """Get scene polygon and datetime."""
@@ -467,7 +579,7 @@ class Product:
 
     @staticmethod
     def _calculate_tile_ratio(flood_path: str, ref_path: str) -> float:
-        """Calculate flood ratio for a single tile."""
+        """Calculate flood ratio for a single tile using reference water raster."""
         with rasterio.open(flood_path) as flood_ds, rasterio.open(ref_path) as ref_ds:
             flood_data = flood_ds.read(1)
             ref_data = ref_ds.read(1)
