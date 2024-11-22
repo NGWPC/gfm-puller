@@ -457,8 +457,9 @@ class Product:
         self.extract_path = extract_path
 
     def calculate_flood_ratios(self) -> dict:
-        """Calculate flood ratios for all tiles in the product."""
+        """Calculate flood ratios for all tiles in the product. Continues processing even if individual tiles fail."""
         ratios = {}
+        failed_tiles = []
 
         # Check if any flood files exist
         flood_files = [f for root, _, files in os.walk(self.extract_path) 
@@ -466,45 +467,72 @@ class Product:
         if not flood_files:
             raise ValueError(f"No flood raster files found in {self.extract_path}")
 
+        def log_debug_info(tile_id: str) -> str:
+            """Gather and format debug information for a tile."""
+            all_files = []
+            for r, _, fs in os.walk(self.extract_path):
+                all_files.extend(fs)
+    
+            debug_info = [f"\nDebug information for tile {tile_id}:"]
+            debug_info.append("\nFiles with 'flood' in them:")
+            debug_info.extend(f"  {f}" for f in [f for f in all_files if 'flood' in f.lower()])
+            debug_info.append("\nFiles with 'reference' in them:")
+            debug_info.extend(f"  {f}" for f in [f for f in all_files if 'reference' in f.lower()])
+            debug_info.append("\nFiles with 'obswater' in them:")
+            debug_info.extend(f"  {f}" for f in [f for f in all_files if 'obswater' in f.lower()])
+            debug_info.append("\n")
+    
+            return "\n".join(debug_info)
+
         # Process each flood file
         for root, _, files in os.walk(self.extract_path):
             for file in files:
                 if 'ENSEMBLE_FLOOD' in file and 'tif' in file:
                     tile_id = self._extract_tile_id(file)
+                    if not tile_id:
+                        print(f"Warning: Could not extract tile ID from filename: {file}")
+                        continue
+                
                     flood_path = os.path.join(root, file)
+            
+                    try:
+                        # First try to find reference water file
+                        ref_path = self._find_reference_file(root, tile_id)
+                
+                        if ref_path:
+                            # Use traditional reference water method
+                            ratio = self._calculate_tile_ratio(flood_path, ref_path)
+                        else:
+                            # Try to derive reference water from OBSWATER
+                            obswater_path = self._find_obswater_file(root, tile_id)
+                            if not obswater_path:
+                                debug_info = log_debug_info(tile_id)
+                                print(debug_info)
+                                error_msg = f"Neither reference water nor obswater raster found for tile {tile_id}"
+                                failed_tiles.append((tile_id, error_msg))
+                                continue  # Skip to next file instead of raising error
                     
-                    # First try to find reference water file
-                    ref_path = self._find_reference_file(root, tile_id)
-                    
-                    if ref_path:
-                        # Use traditional reference water method
-                        ratio = self._calculate_tile_ratio(flood_path, ref_path)
-                    else:
-                        # Try to derive reference water from OBSWATER
-                        obswater_path = self._find_obswater_file(root, tile_id)
-                        if not obswater_path:
-                            # Get all files in the extract path for debugging
-                            all_files = []
-                            for r, _, fs in os.walk(self.extract_path):
-                                all_files.extend(fs)
-                            
-                            print(f"\nDebug information for tile {tile_id}:")
-                            print("\nFiles with 'flood' in them:")
-                            for f in [f for f in all_files if 'flood' in f.lower()]:
-                                print(f"  {f}")
-                            print("\nFiles with 'reference' in them:")
-                            for f in [f for f in all_files if 'reference' in f.lower()]:
-                                print(f"  {f}")
-                            print("\nFiles with 'obswater' in them:")
-                            for f in [f for f in all_files if 'obswater' in f.lower()]:
-                                print(f"  {f}")
-                            print("\n")
-                            
-                            raise ValueError(f"Neither reference water nor obswater raster found for tile {tile_id}")
-                        
-                        ratio = self._calculate_tile_ratio_from_obswater(flood_path, obswater_path)
-                    
-                    ratios[tile_id] = ratio
+                            ratio = self._calculate_tile_ratio_from_obswater(flood_path, obswater_path)
+                
+                        ratios[tile_id] = ratio
+                
+                    except Exception as e:
+                        error_msg = f"Error processing tile {tile_id}: {str(e)}"
+                        print(error_msg)
+                        failed_tiles.append((tile_id, error_msg))
+                        continue  # Skip to next file
+
+        # If no tiles were successfully processed, raise error with details
+        if not ratios and failed_tiles:
+            error_messages = "\n".join(f"Tile {tile_id}: {error}" for tile_id, error in failed_tiles)
+            raise ValueError(f"Failed to process any tiles successfully. Errors:\n{error_messages}")
+
+        # If some tiles failed but others succeeded, log the failures but return the successful ratios
+        if failed_tiles:
+            print("\nWarning: Some tiles failed to process:")
+            for tile_id, error in failed_tiles:
+                print(f"- Tile {tile_id}: {error}")
+            print(f"\nSuccessfully processed {len(ratios)} tiles.")
 
         return ratios
 
@@ -571,9 +599,9 @@ class Product:
 
     def _find_reference_file(self, root: str, tile_id: str) -> Optional[str]:
         """Find reference water file for given tile ID."""
-        pattern1 = f"*{tile_id}_REFERENCE_WATER_OUT_*.tif"
+        pattern1 = f"*{tile_id}_REFERENCE_WATER*.tif"
         # Pattern 2: Files starting with REFERENCE_WATER_OUT containing tile_id
-        pattern2 = f"REFERENCE_WATER_OUT_*{tile_id}*.tif"
+        pattern2 = f"REFERENCE_WATER*{tile_id}*.tif"
     
         matches = list(Path(root).glob(pattern1))
         if not matches:
