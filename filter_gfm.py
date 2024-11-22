@@ -510,9 +510,17 @@ class Product:
 
     def _find_obswater_file(self, root: str, tile_id: str) -> Optional[str]:
         """Find OBSWATER file for given tile ID."""
-        pattern = f"*{tile_id}_ENSEMBLE_OBSWATER_*.tif"
-        matches = list(Path(root).glob(pattern))
-        return str(matches[0]) if matches else None
+        patterns = [
+            f"*{tile_id}_ENSEMBLE_OBSWATER_*.tif",  
+            f"ENSEMBLE_OBSWATER_*{tile_id}*.tif",   
+        ]
+    
+        for pattern in patterns:
+            matches = list(Path(root).glob(pattern))
+            if matches:
+                return str(matches[0])
+    
+        return None
 
     def _calculate_tile_ratio_from_obswater(self, flood_path: str, obswater_path: str) -> float:
         """
@@ -566,15 +574,11 @@ class Product:
         pattern1 = f"*{tile_id}_REFERENCE_WATER_OUT_*.tif"
         # Pattern 2: Files starting with REFERENCE_WATER_OUT containing tile_id
         pattern2 = f"REFERENCE_WATER_OUT_*{tile_id}*.tif"
-        pattern3 = "REFERENCE_WATER_OUT_*_------_*.tif"
     
         matches = list(Path(root).glob(pattern1))
         if not matches:
             matches = list(Path(root).glob(pattern2))
    
-        if not matches:
-            matches = list(Path(root).glob(pattern3))
-
         return str(matches[0]) if matches else None
 
     @staticmethod
