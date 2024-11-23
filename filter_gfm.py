@@ -1029,32 +1029,34 @@ class Controller:
                         f"Found {len(products)} products for region {region}"
                     )
 
+                    # Inside process_monthly_data method:
                     if self.debug_mode:
-                        # Sequential processing for debugging
                         for product_info in products:
                             try:
                                 self.handle_product(product_info['cell_code'], aoi_id, region)
                             except Exception as e:
                                 self.logger.error(f"Failed to process product {product_info['cell_code']}: {str(e)}")
-                                # Continue with next product
                                 continue
                     else:
-                        # Parallel processing
                         process_args = [(product_info['cell_code'], aoi_id, region)
-                                      for product_info in products]
+                                       for product_info in products]
+    
+                        def handle_product_wrapper(args):
+                            try:
+                                return self.handle_product(*args)
+                            except Exception as e:
+                                self.logger.error(f"Process failed for product {args[0]}: {str(e)}")
+                                return None
+
                         with Pool(processes=num_processes) as pool:
-                            # Use starmap_async to prevent exceptions from stopping other processes
-                            results = [pool.apply_async(self.handle_product, args) 
-                                     for args in process_args]
-                            
-                            # Wait for all processes and collect any errors
-                            for result, (product_id, _, _) in zip(results, process_args):
-                                try:
-                                    result.get()
-                                except Exception as e:
-                                    self.logger.error(f"Failed to process product {product_id}: {str(e)}")
-                                    # Continue with next product
-                                    continue
+                            try:
+                                pool.map(handle_product_wrapper, process_args)
+                            except Exception as e:
+                                self.logger.error(f"Pool execution failed: {str(e)}")
+                                # Don't re-raise - let other regions process
+                            finally:
+                                pool.close()
+                                pool.join()
 
                 except Exception as e:
                     pdb.set_trace()
@@ -1074,79 +1076,97 @@ class Controller:
         try:
             # Create new instances for this process
             gfm_client = GFMClient(self.config)
-    
+
             # Create FlowProcessor using shared hydrofabric features
             flow_processor = FlowProcessor.from_shared_features()
-    
-            # Download and process product using the AOI ID
-            product = gfm_client.download_product(product_id, aoi_id)
-    
-            try:
-                # Calculate flood ratios
-                flood_ratios = product.calculate_flood_ratios()
-            except ValueError as e:
-                if "No reference water raster found" in str(e):
-                    self.logger.log_product_error(
-                        record,
-                        error_type="NoReferenceWaterError",
-                        error_message=str(e)
-                    )
-                    if hasattr(product, 'extract_path'):
-                        shutil.rmtree(product.extract_path)
-                    return  # Exit the function but don't raise the exception
-                raise  # Re-raise other ValueError exceptions
-    
-            # Create flowfile if needed
-            flowfile_data = None
-            was_uploaded = False
-    
-            if max(flood_ratios.values(), default=0.0) > self.config.flood_threshold:
-                scene_info = product.get_scene_info()
-                if scene_info and scene_info.get('polygon'):
-                    flow_df, nwm_version = flow_processor.create_flowfile(
-                        scene_info['polygon'],
-                        scene_info['datetime'],
-                        region=region  
-                    )
-                
-                    # Only create flowfile tuple if we have data
-                    if flow_df is not None and nwm_version is not None:
-                        flowfile_data = (flow_df, nwm_version)
-    
-                    s3_uploader = S3Uploader(self.config)
-            
-                    # Upload all files
-                    s3_uploader.upload_product_files(
-                        product.extract_path,
-                        flood_ratios,
-                        flowfile_data
-                    )
-                    was_uploaded = True
 
-            # Log success
-            self.logger.log_product_success(
-                record,
-                flood_ratios,
-                flowfile_data is not None,  # Check if we have flowfile data
-                was_uploaded
-            )
-    
-            # Clean up
-            shutil.rmtree(product.extract_path)
-    
-        except Exception as e:
-            self.logger.log_product_error(
-                record,
-                error_type=type(e).__name__,
-                error_message=str(e)
-            )
-            if 'product' in locals() and hasattr(product, 'extract_path'):
+            # Download and process product using the AOI ID
+            try:
+                product = gfm_client.download_product(product_id, aoi_id)
+            except Exception as e:
+                self.logger.log_product_error(
+                    record,
+                    error_type="DownloadError",
+                    error_message=f"Failed to download product: {str(e)}"
+                )
+                return  # Exit gracefully if download fails
+
+            extract_path = None
+            try:
+                extract_path = product.extract_path
+                # Calculate flood ratios
                 try:
-                    shutil.rmtree(product.extract_path)
-                except Exception as cleanup_error:
-                    self.logger.error(
-                        f"Failed to clean up product directory: {str(cleanup_error)}"
-                    )
+                    flood_ratios = product.calculate_flood_ratios()
+                except ValueError as e:
+                    if "Failed to process any tiles successfully" in str(e):
+                        self.logger.log_product_error(
+                            record,
+                            error_type="AllTilesFailedError",
+                            error_message=str(e)
+                        )
+                        if extract_path:
+                            shutil.rmtree(extract_path)
+                        return  # Exit gracefully if all tiles fail
+                    raise  # Re-raise other ValueError exceptions
+
+                # Create flowfile if needed
+                flowfile_data = None
+                was_uploaded = False
+
+                if max(flood_ratios.values(), default=0.0) > self.config.flood_threshold:
+                    try:
+                        scene_info = product.get_scene_info()
+                        if scene_info and scene_info.get('polygon'):
+                            flow_df, nwm_version = flow_processor.create_flowfile(
+                                scene_info['polygon'],
+                                scene_info['datetime'],
+                                region=region  
+                            )
+                    
+                            # Only create flowfile tuple if we have data
+                            if flow_df is not None and nwm_version is not None:
+                                flowfile_data = (flow_df, nwm_version)
+
+                            s3_uploader = S3Uploader(self.config)
+                
+                            # Upload all files
+                            s3_uploader.upload_product_files(
+                                product.extract_path,
+                                flood_ratios,
+                                flowfile_data
+                            )
+                            was_uploaded = True
+                    except Exception as e:
+                        self.logger.error(f"Failed to process flowfile or upload: {str(e)}")
+                        # Continue execution - we still want to log the product status
+
+                # Log success
+                self.logger.log_product_success(
+                    record,
+                    flood_ratios,
+                    flowfile_data is not None,
+                    was_uploaded
+                )
+
+            except Exception as e:
+                self.logger.log_product_error(
+                    record,
+                    error_type=type(e).__name__,
+                    error_message=str(e)
+                )
+            finally:
+                # Always attempt cleanup
+                if extract_path and os.path.exists(extract_path):
+                    try:
+                        shutil.rmtree(extract_path)
+                    except Exception as cleanup_error:
+                        self.logger.error(
+                            f"Failed to clean up product directory: {str(cleanup_error)}"
+                        )
+
+        except Exception as outer_e:
+            # Catch any errors that might have escaped the inner try blocks
+            self.logger.error(f"Critical error in handle_product: {str(outer_e)}")
 
     @staticmethod
     def _get_date_range(year: int, month: int) -> tuple:
