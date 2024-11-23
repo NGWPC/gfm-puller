@@ -295,22 +295,22 @@ class GFMClient:
     def download_product(self, product_id: str, aoi_id: str) -> 'Product':
         """
         Download and extract a product with enhanced error handling and timeout handling.
-    
+
         Args:
             product_id: ID of the product to download
             aoi_id: ID of the AOI
-        
+    
         Returns:
             Product object
-        
+    
         Raises:
             ValueError: If download link is invalid or download fails
-            RuntimeError: If extraction fails
+            RuntimeError: If extraction fails after all retries
         """
         download_path = None
         extract_path = None
         max_retries = 5
-    
+
         # Longer timeouts for large files
         CONNECT_TIMEOUT = 160    # seconds to establish connection
         READ_TIMEOUT = 1800    # 30 minutes to download file
@@ -327,103 +327,131 @@ class GFMClient:
                     )
                     download_response.raise_for_status()
                     download_link = download_response.json().get('download_link')
-                
+            
                     if not download_link:
                         raise ValueError("Received empty download link")
-                    
+                
                     break
                 except Exception as e:
                     if attempt == max_retries - 1:
                         raise ValueError(f"Failed to get download link after {max_retries} attempts: {str(e)}")
                     sleep(uniform(5, 15) * (attempt + 1))
                     continue
-    
+
             # Create temp directory for this product
             extract_path = os.path.join(self.config.paths['temp'], product_id)
             os.makedirs(extract_path, exist_ok=True)
-    
-            # Download with retries
-            download_path = os.path.join(self.config.paths['temp'], f'{product_id}.zip')
-    
-            for attempt in range(max_retries):
+
+            # Outer loop to retry the entire download if zip is invalid
+            for zip_attempt in range(max_retries):
                 try:
-                    print(f"Process {os.getpid()} downloading {product_id} to {download_path} (Attempt {attempt + 1}/{max_retries})")
+                    # Download with retries
+                    download_path = os.path.join(self.config.paths['temp'], f'{product_id}.zip')
+
+                    # Inner loop for download attempts
+                    for download_attempt in range(max_retries):
+                        try:
+                            print(f"Process {os.getpid()} downloading {product_id} to {download_path} "
+                                  f"(Download Attempt {download_attempt + 1}/{max_retries}, "
+                                  f"Zip Attempt {zip_attempt + 1}/{max_retries})")
+                    
+                            # Create a session with custom timeout settings
+                            session = requests.Session()
+                            session.mount('https://', requests.adapters.HTTPAdapter(
+                                max_retries=3,
+                                pool_connections=10,
+                                pool_maxsize=10
+                            ))
+                    
+                            # Stream the response with increased timeouts
+                            response = session.get(
+                                download_link, 
+                                stream=True,
+                                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
+                            )
+                            response.raise_for_status()
+                    
+                            # Get total file size if available
+                            total_size = int(response.headers.get('content-length', 0))
+                    
+                            # Open file in binary write mode
+                            with open(download_path, 'wb') as f:
+                                if total_size == 0:  # No content length header
+                                    f.write(response.content)
+                                else:
+                                    for chunk in response.iter_content(chunk_size=8192):
+                                        if chunk:
+                                            f.write(chunk)
+                    
+                            # Verify the download
+                            if not os.path.exists(download_path):
+                                raise ValueError("Download file not created")
+                        
+                            file_size = os.path.getsize(download_path)
+                            if file_size == 0:
+                                raise ValueError("Downloaded file is empty")
+                        
+                            if total_size > 0 and file_size != total_size:
+                                raise ValueError(f"Incomplete download: got {file_size} bytes, expected {total_size}")
+                    
+                            print(f"Download completed for {product_id}. File size: {file_size}")
+                            break
+                    
+                        except requests.Timeout as timeout_error:
+                            print(f"Timeout error for {product_id} (Attempt {download_attempt + 1}): {str(timeout_error)}")
+                            if os.path.exists(download_path):
+                                os.remove(download_path)
+                            if download_attempt < max_retries - 1:
+                                # Increase timeout for next attempt
+                                READ_TIMEOUT *= 1.5
+                                sleep(uniform(10, 30) * (download_attempt + 1))
+                            else:
+                                raise
                 
-                    # Create a session with custom timeout settings
-                    session = requests.Session()
-                    session.mount('https://', requests.adapters.HTTPAdapter(
-                        max_retries=3,
-                        pool_connections=10,
-                        pool_maxsize=10
-                    ))
-                
-                    # Stream the response with increased timeouts
-                    response = session.get(
-                        download_link, 
-                        stream=True,
-                        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
-                    )
-                    response.raise_for_status()
-                
-                    # Get total file size if available
-                    total_size = int(response.headers.get('content-length', 0))
-                
-                    # Open file in binary write mode
-                    with open(download_path, 'wb') as f:
-                        if total_size == 0:  # No content length header
-                            f.write(response.content)
+                        except Exception as download_error:
+                            print(f"Download error for {product_id} (Attempt {download_attempt + 1}): {str(download_error)}")
+                            if os.path.exists(download_path):
+                                os.remove(download_path)
+                            if download_attempt < max_retries - 1:
+                                sleep(uniform(10, 30) * (download_attempt + 1))
+                            else:
+                                raise
+
+                    # Verify zip file integrity and extract
+                    try:
+                        with zipfile.ZipFile(download_path, 'r') as zip_ref:
+                            # Test zip file integrity
+                            if zip_ref.testzip() is not None:
+                                raise zipfile.BadZipFile("Zip file is corrupted")
+                            # Extract the zip file
+                            zip_ref.extractall(extract_path)
+                    
+                        # If we get here, zip file was good and extracted successfully
+                        break
+                    
+                    except zipfile.BadZipFile as e:
+                        print(f"Invalid zip file for {product_id} (Attempt {zip_attempt + 1}/{max_retries}): {str(e)}")
+                        # Clean up the bad zip file
+                        if os.path.exists(download_path):
+                            os.remove(download_path)
+                        if zip_attempt < max_retries - 1:
+                            sleep(uniform(10, 30) * (zip_attempt + 1))
+                            continue  # Try downloading again
                         else:
-                            for chunk in response.iter_content(chunk_size=8192):
-                                if chunk:
-                                    f.write(chunk)
-                
-                    # Verify the download
-                    if not os.path.exists(download_path):
-                        raise ValueError("Download file not created")
-                    
-                    file_size = os.path.getsize(download_path)
-                    if file_size == 0:
-                        raise ValueError("Downloaded file is empty")
-                    
-                    if total_size > 0 and file_size != total_size:
-                        raise ValueError(f"Incomplete download: got {file_size} bytes, expected {total_size}")
-                
-                    print(f"Download completed for {product_id}. File size: {file_size}")
-                    break
-                
-                except requests.Timeout as timeout_error:
-                    print(f"Timeout error for {product_id} (Attempt {attempt + 1}): {str(timeout_error)}")
+                            raise RuntimeError(f"Failed to get valid zip file after {max_retries} attempts")
+
+                except Exception as attempt_error:
+                    # Clean up from this attempt before retrying or failing
                     if os.path.exists(download_path):
                         os.remove(download_path)
-                    if attempt < max_retries - 1:
-                        # Increase timeout for next attempt
-                        READ_TIMEOUT *= 1.5
-                        sleep(uniform(10, 30) * (attempt + 1))
-                    else:
-                        raise ValueError(f"Failed to download after {max_retries} attempts due to timeouts")
-            
-                except Exception as download_error:
-                    print(f"Download error for {product_id} (Attempt {attempt + 1}): {str(download_error)}")
-                    if os.path.exists(download_path):
-                        os.remove(download_path)
-                    if attempt < max_retries - 1:
-                        sleep(uniform(10, 30) * (attempt + 1))
-                    else:
-                        raise ValueError(f"Failed to download after {max_retries} attempts: {str(download_error)}")
+                    if zip_attempt < max_retries - 1:
+                        print(f"Retrying entire download for {product_id} due to error: {str(attempt_error)}")
+                        continue
+                    raise
 
-            # Verify zip file integrity before extraction
-            try:
-                with zipfile.ZipFile(download_path, 'r') as zip_ref:
-                    # Test zip file integrity
-                    if zip_ref.testzip() is not None:
-                        raise zipfile.BadZipFile("Zip file is corrupted")
-                    # Extract the zip file
-                    zip_ref.extractall(extract_path)
-            except zipfile.BadZipFile as e:
-                raise RuntimeError(f"Invalid or corrupted zip file: {str(e)}")
-
-            # Clean up zip file
-            os.remove(download_path)
+            # Clean up zip file after successful extraction
+            if os.path.exists(download_path):
+                os.remove(download_path)
         
             # Verify extraction succeeded
             if not os.path.exists(extract_path) or not os.listdir(extract_path):
@@ -1002,6 +1030,14 @@ class Controller:
             raise ValueError("No valid AOI files found")
         return aois
 
+    def _handle_product_wrapper(self, args):
+        """Wrapper for handle_product to be used with multiprocessing."""
+        try:
+            return self.handle_product(*args)
+        except Exception as e:
+            self.logger.error(f"Process failed for product {args[0]}: {str(e)}")
+            return None
+
     def process_monthly_data(self, year: int, month: int):
         """Process data for a given month for all regions."""
         self.logger = Logger(year, month)
@@ -1010,7 +1046,7 @@ class Controller:
         # Create GFM client for getting products (will not be pickled)
         gfm_client = GFMClient(self.config)
 
-        # set number of processes for parallel mode. 
+        # set number of processes for parallel mode
         num_cores = cpu_count()
         num_processes = max(1, num_cores - 1)  # Use N-1 cores, minimum of 1
         self.logger.info(f"Using {num_processes} processes out of {num_cores} available cores")
@@ -1029,8 +1065,8 @@ class Controller:
                         f"Found {len(products)} products for region {region}"
                     )
 
-                    # Inside process_monthly_data method:
                     if self.debug_mode:
+                        # Sequential processing for debugging
                         for product_info in products:
                             try:
                                 self.handle_product(product_info['cell_code'], aoi_id, region)
@@ -1038,28 +1074,24 @@ class Controller:
                                 self.logger.error(f"Failed to process product {product_info['cell_code']}: {str(e)}")
                                 continue
                     else:
+                        # Parallel processing with error handling
                         process_args = [(product_info['cell_code'], aoi_id, region)
-                                       for product_info in products]
-    
-                        def handle_product_wrapper(args):
-                            try:
-                                return self.handle_product(*args)
-                            except Exception as e:
-                                self.logger.error(f"Process failed for product {args[0]}: {str(e)}")
-                                return None
-
+                                      for product_info in products]
+                        
+                        # Create a partial function with self argument bound
+                        wrapped_handler = partial(self._handle_product_wrapper)
+                        
                         with Pool(processes=num_processes) as pool:
                             try:
-                                pool.map(handle_product_wrapper, process_args)
+                                # Use map for better error handling
+                                pool.map(wrapped_handler, process_args)
                             except Exception as e:
                                 self.logger.error(f"Pool execution failed: {str(e)}")
-                                # Don't re-raise - let other regions process
                             finally:
                                 pool.close()
                                 pool.join()
 
                 except Exception as e:
-                    pdb.set_trace()
                     self.logger.error(f"Failed to process region {region}: {str(e)}")
                     continue
 
