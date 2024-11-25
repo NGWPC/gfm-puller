@@ -144,6 +144,7 @@ class S3Uploader:
                     file_path = os.path.join(root, filename)
                     # Compute relative path from product directory
                     relative_path = os.path.relpath(file_path, product_path)
+                    relative_path = relative_path.replace(os.sep, '/')
                     s3_key = posixpath.join(base_key, relative_path)
                     
                     self.s3_client.upload_file(file_path, self.bucket, s3_key)
@@ -601,10 +602,10 @@ class Product:
     def get_scene_info(self) -> dict:
         """Get scene polygon and datetime."""
         footprint_file = next(
-            (f for f in os.listdir(self.extract_path) if 'footprint' in f.lower()),
+            (f for f in os.listdir(self.extract_path) if 'footprint' in f.lower() or (f.startswith('S1') and f.endswith('.geojson'))),
             None
-        )
-        
+        )        
+
         if footprint_file:
             with open(os.path.join(self.extract_path, footprint_file)) as f:
                 footprint = json.load(f)
@@ -667,42 +668,46 @@ class FlowProcessor:
     def create_flowfile(self, polygon: Polygon, target_datetime: datetime, region: str = 'conus') -> tuple[Optional[pd.DataFrame], Optional[str]]:
         """
         Create flowfile for a given polygon and datetime.
-    
+
         Args:
             polygon: Shapely polygon of the area of interest
             target_datetime: Target datetime for flow data
-    
+
         Returns:
             Tuple of (DataFrame with feature_id and streamflow columns, NWM version number)
-            or (None, None) if no data found
+
+        Raises:
+            ValueError: If no NWM features or flow data are found
         """
         if region not in self.VALID_REGIONS:
             raise ValueError(f"Invalid region. Must be one of {self.VALID_REGIONS}")
-        
+
         try:
             # Get features in polygon using region-specific hydrofabric
             feature_ids = self.get_features_in_polygon(polygon, region)
             if not feature_ids:
-                logging.warning(f"No NWM features found in scene polygon for region {region}")
-                return None, None
+                error_message = f"No NWM features found in scene polygon for region {region}"
+                logging.warning(error_message)
+                raise ValueError(error_message)
 
             # Get flow data for features
             flow_data_result = self.get_flow_data(target_datetime, region)
-        
+
             if flow_data_result is None:
-                logging.warning(f"No NWM flow data found for datetime in region {region}")
-                return None, None
+                error_message = f"No NWM flow data found for datetime in region {region}"
+                logging.warning(error_message)
+                raise ValueError(error_message)
 
             flow_data, nwm_version = flow_data_result
-        
+
             # Filter flow data to features in polygon
             filtered_flow_data = flow_data[flow_data['feature_id'].isin(feature_ids)]
-        
+
             return filtered_flow_data, nwm_version
-        
+
         except Exception as e:
             logging.error(f"Error creating flowfile: {str(e)}")
-            return None, None
+            raise  # Re-raise the exception to be caught by calling code
 
     def get_features_in_polygon(self, polygon: Polygon, region: str) -> List[str]:
         """Get feature IDs that intersect with or are within the polygon."""
@@ -1146,31 +1151,49 @@ class Controller:
                 was_uploaded = False
 
                 if max(flood_ratios.values(), default=0.0) > self.config.flood_threshold:
+                    # First try to get scene info and create flowfile if possible
                     try:
                         scene_info = product.get_scene_info()
-                        if scene_info and scene_info.get('polygon'):
-                            flow_df, nwm_version = flow_processor.create_flowfile(
-                                scene_info['polygon'],
-                                scene_info['datetime'],
-                                region=region  
-                            )
+                        if not (scene_info and scene_info.get('polygon')):
+                            raise ValueError("couldn't find sentinel footprint")
                     
-                            # Only create flowfile tuple if we have data
-                            if flow_df is not None and nwm_version is not None:
-                                flowfile_data = (flow_df, nwm_version)
+                        # Try to create flowfile since we have scene info
+                        flow_df, nwm_version = flow_processor.create_flowfile(
+                            scene_info['polygon'],
+                            scene_info['datetime'],
+                            region=region  
+                        )
+                    
+                        # Only create flowfile tuple if we have data
+                        if flow_df is not None and nwm_version is not None:
+                            flowfile_data = (flow_df, nwm_version)
 
-                            s3_uploader = S3Uploader(self.config)
-                
-                            # Upload all files
-                            s3_uploader.upload_product_files(
-                                product.extract_path,
-                                flood_ratios,
-                                flowfile_data
-                            )
-                            was_uploaded = True
                     except Exception as e:
-                        self.logger.error(f"Failed to process flowfile or upload: {str(e)}")
-                        # Continue execution - we still want to log the product status
+                        self.logger.log_product_error(
+                            record,
+                            error_type=type(e).__name__,
+                            error_message=f"Failed to process flowfile: {str(e)}"
+                        )
+                        # Continue to upload attempt
+                
+                    # Always attempt upload if above threshold, regardless of flowfile status
+                    try:
+                        s3_uploader = S3Uploader(self.config)
+                        s3_uploader.upload_product_files(
+                            product.extract_path,
+                            flood_ratios,
+                            flowfile_data
+                        )
+                        was_uploaded = True
+                    except Exception as e:
+                        self.logger.log_product_error(
+                            record,
+                            error_type=type(e).__name__,
+                            error_message=f"Failed to upload: {str(e)}"
+                        )
+                        if extract_path:
+                            shutil.rmtree(extract_path)
+                        return  # Exit gracefully if upload fails
 
                 # Log success
                 self.logger.log_product_success(
