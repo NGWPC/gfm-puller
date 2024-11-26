@@ -1013,7 +1013,8 @@ class Controller:
         if not aoi_dir.exists():
             raise ValueError("AOI directory not found")
 
-        for region in ['conus', 'alaska', 'hawaii']:
+        # for region in ['conus', 'alaska', 'hawaii']:
+        for region in ['alaska']:
             aoi_file = aoi_dir / f"{region}.geojson"
             if not aoi_file.exists():
                 continue
@@ -1109,7 +1110,8 @@ class Controller:
     def handle_product(self, product_id: str, aoi_id: str, region: str):
         """Handle single product processing for specific region."""
         record = self.logger.start_product_processing(product_id, region)
-
+        # Initialize error flag
+        errors_occurred = False
         try:
             # Create new instances for this process
             gfm_client = GFMClient(self.config)
@@ -1126,6 +1128,7 @@ class Controller:
                     error_type="DownloadError",
                     error_message=f"Failed to download product: {str(e)}"
                 )
+                errors_occurred = True  
                 return  # Exit gracefully if download fails
 
             extract_path = None
@@ -1141,6 +1144,7 @@ class Controller:
                             error_type="AllTilesFailedError",
                             error_message=str(e)
                         )
+                        errors_occurred = True  
                         if extract_path:
                             shutil.rmtree(extract_path)
                         return  # Exit gracefully if all tiles fail
@@ -1156,14 +1160,14 @@ class Controller:
                         scene_info = product.get_scene_info()
                         if not (scene_info and scene_info.get('polygon')):
                             raise ValueError("couldn't find sentinel footprint")
-                    
+                
                         # Try to create flowfile since we have scene info
                         flow_df, nwm_version = flow_processor.create_flowfile(
                             scene_info['polygon'],
                             scene_info['datetime'],
                             region=region  
                         )
-                    
+                
                         # Only create flowfile tuple if we have data
                         if flow_df is not None and nwm_version is not None:
                             flowfile_data = (flow_df, nwm_version)
@@ -1174,9 +1178,8 @@ class Controller:
                             error_type=type(e).__name__,
                             error_message=f"Failed to process flowfile: {str(e)}"
                         )
-                        # Continue to upload attempt
-                
-                    # Always attempt upload if above threshold, regardless of flowfile status
+                        errors_occurred = True  
+            
                     try:
                         s3_uploader = S3Uploader(self.config)
                         s3_uploader.upload_product_files(
@@ -1191,17 +1194,19 @@ class Controller:
                             error_type=type(e).__name__,
                             error_message=f"Failed to upload: {str(e)}"
                         )
+                        errors_occurred = True  
                         if extract_path:
                             shutil.rmtree(extract_path)
                         return  # Exit gracefully if upload fails
 
-                # Log success
-                self.logger.log_product_success(
-                    record,
-                    flood_ratios,
-                    flowfile_data is not None,
-                    was_uploaded
-                )
+                # Log success only if no errors occurred
+                if not errors_occurred:
+                    self.logger.log_product_success(
+                        record,
+                        flood_ratios,
+                        flowfile_data is not None,
+                        was_uploaded
+                    )
 
             except Exception as e:
                 self.logger.log_product_error(
@@ -1209,6 +1214,7 @@ class Controller:
                     error_type=type(e).__name__,
                     error_message=str(e)
                 )
+                errors_occurred = True  
             finally:
                 # Always attempt cleanup
                 if extract_path and os.path.exists(extract_path):
