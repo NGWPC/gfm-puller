@@ -828,12 +828,16 @@ class ProcessingRecord:
     flood_ratio_max: float = 0.0
     end_time: datetime = field(default_factory=datetime.now)
 
-    def update_on_error(self, error_type: str, error_message: str):
+    def update_on_error(self, error_type: str, error_message: str, was_uploaded: Optional[bool] = None, has_flowfile: Optional[bool] = None):
         """Update record when processing fails."""
         self.end_time = datetime.now()
         self.error = error_type
         self.status = "failed"
         self.error = error_message
+        if was_uploaded is not None:
+            self.was_uploaded = was_uploaded
+        if has_flowfile is not None:
+            self.has_flowfile = has_flowfile
 
     def update_on_success(self, flood_ratios: dict, has_flowfile: bool, was_uploaded: bool):  
         """Update record when processing succeeds."""
@@ -931,9 +935,9 @@ class Logger:
         )
         self._write_record(record)
 
-    def log_product_error(self, record: ProcessingRecord, error_type: str, error_message: str):
+    def log_product_error(self, record: ProcessingRecord, error_type: str, error_message: str, was_uploaded: Optional[bool] = None, has_flowfile: Optional[bool] = None):
         """Log product processing error."""
-        record.update_on_error(error_type, error_message)
+        record.update_on_error(error_type, error_message, was_uploaded=was_uploaded, has_flowfile=has_flowfile)
         self.error(
             f"Failed to process product {record.product_id}. "
             f"Error type: {error_type}, Message: {error_message}"
@@ -1013,8 +1017,7 @@ class Controller:
         if not aoi_dir.exists():
             raise ValueError("AOI directory not found")
 
-        # for region in ['conus', 'alaska', 'hawaii']:
-        for region in ['alaska']:
+        for region in ['conus', 'alaska', 'hawaii']:
             aoi_file = aoi_dir / f"{region}.geojson"
             if not aoi_file.exists():
                 continue
@@ -1110,8 +1113,13 @@ class Controller:
     def handle_product(self, product_id: str, aoi_id: str, region: str):
         """Handle single product processing for specific region."""
         record = self.logger.start_product_processing(product_id, region)
-        # Initialize error flag
+        # Initialize error flag and tracking variables
         errors_occurred = False
+        was_uploaded = False
+        has_flowfile = False
+        error_messages = []
+        error_types = []
+        extract_path = None
         try:
             # Create new instances for this process
             gfm_client = GFMClient(self.config)
@@ -1123,36 +1131,29 @@ class Controller:
             try:
                 product = gfm_client.download_product(product_id, aoi_id)
             except Exception as e:
-                self.logger.log_product_error(
-                    record,
-                    error_type="DownloadError",
-                    error_message=f"Failed to download product: {str(e)}"
-                )
+                error_messages.append(f"Failed to download product: {str(e)}")
+                error_types.append(type(e).__name__)
                 errors_occurred = True  
-                return  # Exit gracefully if download fails
+                # Cannot proceed if download fails
+                return
 
-            extract_path = None
+            extract_path = product.extract_path
             try:
-                extract_path = product.extract_path
                 # Calculate flood ratios
                 try:
                     flood_ratios = product.calculate_flood_ratios()
                 except ValueError as e:
                     if "Failed to process any tiles successfully" in str(e):
-                        self.logger.log_product_error(
-                            record,
-                            error_type="AllTilesFailedError",
-                            error_message=str(e)
-                        )
+                        error_messages.append(str(e))
+                        error_types.append("AllTilesFailedError")
                         errors_occurred = True  
-                        if extract_path:
-                            shutil.rmtree(extract_path)
-                        return  # Exit gracefully if all tiles fail
-                    raise  # Re-raise other ValueError exceptions
+                        # Cannot proceed if all tiles fail
+                        return  
+                    else:
+                        raise  # Re-raise other ValueError exceptions
 
                 # Create flowfile if needed
                 flowfile_data = None
-                was_uploaded = False
 
                 if max(flood_ratios.values(), default=0.0) > self.config.flood_threshold:
                     # First try to get scene info and create flowfile if possible
@@ -1160,26 +1161,24 @@ class Controller:
                         scene_info = product.get_scene_info()
                         if not (scene_info and scene_info.get('polygon')):
                             raise ValueError("couldn't find sentinel footprint")
-                
+
                         # Try to create flowfile since we have scene info
                         flow_df, nwm_version = flow_processor.create_flowfile(
                             scene_info['polygon'],
                             scene_info['datetime'],
                             region=region  
                         )
-                
+
                         # Only create flowfile tuple if we have data
                         if flow_df is not None and nwm_version is not None:
                             flowfile_data = (flow_df, nwm_version)
+                            has_flowfile = True
 
                     except Exception as e:
-                        self.logger.log_product_error(
-                            record,
-                            error_type=type(e).__name__,
-                            error_message=f"Failed to process flowfile: {str(e)}"
-                        )
-                        errors_occurred = True  
-            
+                        error_messages.append(f"Failed to process flowfile: {str(e)}")
+                        error_types.append(type(e).__name__)
+                        errors_occurred = True              
+
                     try:
                         s3_uploader = S3Uploader(self.config)
                         s3_uploader.upload_product_files(
@@ -1188,46 +1187,62 @@ class Controller:
                             flowfile_data
                         )
                         was_uploaded = True
+
                     except Exception as e:
-                        self.logger.log_product_error(
-                            record,
-                            error_type=type(e).__name__,
-                            error_message=f"Failed to upload: {str(e)}"
-                        )
+                        error_messages.append(f"Failed to upload: {str(e)}")
+                        error_types.append(type(e).__name__)
                         errors_occurred = True  
                         if extract_path:
                             shutil.rmtree(extract_path)
-                        return  # Exit gracefully if upload fails
+                        # Proceed to cleanup and error logging
 
-                # Log success only if no errors occurred
-                if not errors_occurred:
+                # Log success or errors
+                if errors_occurred:
+                    self.logger.log_product_error(
+                        record,
+                        error_type="; ".join(error_types),
+                        error_message="; ".join(error_messages),
+                        was_uploaded=was_uploaded,
+                        has_flowfile=has_flowfile
+                    )
+                else:
                     self.logger.log_product_success(
                         record,
                         flood_ratios,
-                        flowfile_data is not None,
+                        has_flowfile,
                         was_uploaded
                     )
 
             except Exception as e:
-                self.logger.log_product_error(
-                    record,
-                    error_type=type(e).__name__,
-                    error_message=str(e)
-                )
+                error_messages.append(str(e))
+                error_types.append(type(e).__name__)
                 errors_occurred = True  
-            finally:
-                # Always attempt cleanup
-                if extract_path and os.path.exists(extract_path):
-                    try:
-                        shutil.rmtree(extract_path)
-                    except Exception as cleanup_error:
-                        self.logger.error(
-                            f"Failed to clean up product directory: {str(cleanup_error)}"
-                        )
 
         except Exception as outer_e:
             # Catch any errors that might have escaped the inner try blocks
-            self.logger.error(f"Critical error in handle_product: {str(outer_e)}")
+            error_messages.append(f"Critical error in handle_product: {str(outer_e)}")
+            error_types.append(type(outer_e).__name__)
+            errors_occurred = True
+
+        finally:
+            # Always attempt cleanup
+            if extract_path and os.path.exists(extract_path):
+                try:
+                    shutil.rmtree(extract_path)
+                except Exception as cleanup_error:
+                    self.logger.error(
+                        f"Failed to clean up product directory: {str(cleanup_error)}"
+                    )
+
+            # If there were errors and we haven't logged them yet
+            if errors_occurred and not record.status:
+                self.logger.log_product_error(
+                    record,
+                    error_type="; ".join(error_types),
+                    error_message="; ".join(error_messages),
+                    was_uploaded=was_uploaded,
+                    has_flowfile=has_flowfile
+                )
 
     @staticmethod
     def _get_date_range(year: int, month: int) -> tuple:
