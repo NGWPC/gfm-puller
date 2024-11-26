@@ -828,7 +828,8 @@ class ProcessingRecord:
     flood_ratio_max: float = 0.0
     end_time: datetime = field(default_factory=datetime.now)
 
-    def update_on_error(self, error_type: str, error_message: str, was_uploaded: Optional[bool] = None, has_flowfile: Optional[bool] = None):
+    def update_on_error(self, error_type: str, error_message: str, was_uploaded: Optional[bool] = None, 
+                       has_flowfile: Optional[bool] = None, flood_ratio_max: Optional[float] = None):
         """Update record when processing fails."""
         self.end_time = datetime.now()
         self.error = error_type
@@ -838,6 +839,8 @@ class ProcessingRecord:
             self.was_uploaded = was_uploaded
         if has_flowfile is not None:
             self.has_flowfile = has_flowfile
+        if flood_ratio_max is not None:
+            self.flood_ratio_max = flood_ratio_max
 
     def update_on_success(self, flood_ratios: dict, has_flowfile: bool, was_uploaded: bool):  
         """Update record when processing succeeds."""
@@ -935,9 +938,12 @@ class Logger:
         )
         self._write_record(record)
 
-    def log_product_error(self, record: ProcessingRecord, error_type: str, error_message: str, was_uploaded: Optional[bool] = None, has_flowfile: Optional[bool] = None):
+    def log_product_error(self, record: ProcessingRecord, error_type: str, error_message: str, 
+                         was_uploaded: Optional[bool] = None, has_flowfile: Optional[bool] = None,
+                         flood_ratio_max: Optional[float] = None):
         """Log product processing error."""
-        record.update_on_error(error_type, error_message, was_uploaded=was_uploaded, has_flowfile=has_flowfile)
+        record.update_on_error(error_type, error_message, was_uploaded=was_uploaded, 
+                             has_flowfile=has_flowfile, flood_ratio_max=flood_ratio_max)
         self.error(
             f"Failed to process product {record.product_id}. "
             f"Error type: {error_type}, Message: {error_message}"
@@ -1120,6 +1126,8 @@ class Controller:
         error_messages = []
         error_types = []
         extract_path = None
+        flood_ratio_max = None
+
         try:
             # Create new instances for this process
             gfm_client = GFMClient(self.config)
@@ -1142,6 +1150,8 @@ class Controller:
                 # Calculate flood ratios
                 try:
                     flood_ratios = product.calculate_flood_ratios()
+                    flood_ratio_max = max(flood_ratios.values(), default=0.0)
+
                 except ValueError as e:
                     if "Failed to process any tiles successfully" in str(e):
                         error_messages.append(str(e))
@@ -1203,7 +1213,8 @@ class Controller:
                         error_type="; ".join(error_types),
                         error_message="; ".join(error_messages),
                         was_uploaded=was_uploaded,
-                        has_flowfile=has_flowfile
+                        has_flowfile=has_flowfile,
+                        flood_ratio_max=flood_ratio_max
                     )
                 else:
                     self.logger.log_product_success(
@@ -1241,7 +1252,8 @@ class Controller:
                     error_type="; ".join(error_types),
                     error_message="; ".join(error_messages),
                     was_uploaded=was_uploaded,
-                    has_flowfile=has_flowfile
+                    has_flowfile=has_flowfile,
+                    flood_ratio_max=flood_ratio_max
                 )
 
     @staticmethod

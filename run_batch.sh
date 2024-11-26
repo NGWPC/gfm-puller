@@ -3,7 +3,7 @@
 # Directory containing the Python script
 SCRIPT_DIR="$HOME/pull-gfm/"
 # Logs directory
-LOGS_DIR="$SCRIPT_DIR/logs"
+LOGS_DIR="${SCRIPT_DIR%/}/logs"
 
 # Create logs directory if it doesn't exist
 mkdir -p "$LOGS_DIR"
