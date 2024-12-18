@@ -102,9 +102,7 @@ class S3Uploader:
         self.logger = logger
         if not os.getenv("AWS_ACCESS_KEY_ID") or not os.getenv("AWS_SECRET_ACCESS_KEY"):
             self.logger.error("AWS credentials not found in environment variables.")
-            self.logger.error(
-                "Please ensure AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set."
-            )
+            self.logger.error("Please ensure AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are set.")
             sys.exit(1)
 
         self.bucket = config.s3_bucket
@@ -117,9 +115,7 @@ class S3Uploader:
             self.s3_client.head_bucket(Bucket=self.bucket)
         except Exception as e:
             self.logger.error(f"Failed to initialize S3 connection: {str(e)}")
-            self.logger.error(
-                "Please check your AWS credentials and bucket configuration."
-            )
+            self.logger.error("Please check your AWS credentials and bucket configuration.")
             sys.exit(1)
 
     def upload_product_files(
@@ -677,22 +673,17 @@ class Product:
                 footprint = json.load(f)
                 return {"datetime": self.date, "polygon": shape(footprint["geometry"])}
         else:
-            self.logger.warning(
-                f"Could not find any footprint files in {self.extract_path}"
-            )
+            self.logger.warning(f"Could not find any footprint files in {self.extract_path}")
         return None
 
-    @staticmethod
-    def _extract_tile_id(filename: str) -> str:
+    def _extract_tile_id(self, filename: str) -> str:
         """Extract tile ID from filename."""
         match = re.search(r"_([E]\d{3}[N]\d{3}T\d)_ENSEMBLE_FLOOD_", filename)
         if not match:
             # Try second pattern: ID near end of filename
             match = re.search(r"_([E]\d{3}[N]\d{3}T\d)_\d{8}\.", filename)
             if not match:
-                self.logger.warning(
-                    f"Trouble finding a tile id in filename: {filename}"
-                )
+                self.logger.warning(f"Trouble finding a tile id in filename: {filename}")
         return match.group(1) if match else None
 
     def _find_reference_file(self, root: str, tile_id: str) -> Optional[str]:
@@ -707,8 +698,7 @@ class Product:
 
         return str(matches[0]) if matches else None
 
-    @staticmethod
-    def _calculate_tile_ratio(flood_path: str, ref_path: str) -> float:
+    def _calculate_tile_ratio(self, flood_path: str, ref_path: str) -> float:
         """Calculate flood ratio for a single tile using reference water raster."""
         with rasterio.open(flood_path) as flood_ds, rasterio.open(ref_path) as ref_ds:
             flood_data = flood_ds.read(1)
@@ -1109,6 +1099,9 @@ class Controller:
         # Create necessary directories
         os.makedirs(config.paths["temp"], exist_ok=True)
 
+        # Set up basic logging before the logger is fully initialized
+        logging.basicConfig(level=logging.INFO)
+
         # Load region AOIs
         self.region_aois = self._load_region_aois()
 
@@ -1118,7 +1111,7 @@ class Controller:
     def _load_hydrofabric(self):
         """Load hydrofabric features into shared_features."""
         global shared_features
-        self.logger.info("Loading hydrofabric features...")
+        logging.info("Loading hydrofabric features...")
         # Load main hydrofabric
         main_features = gpd.read_file(self.config.paths["main_hydrofabric"])
         if main_features.crs != "EPSG:4326":
@@ -1133,7 +1126,7 @@ class Controller:
             "hawaii": main_features,
             "alaska": ak_features,
         }
-        self.logger.info("Finished loading hydrofabric features.")
+        logging.info("Finished loading hydrofabric features.")
 
     def _load_region_aois(self) -> Dict[str, List]:
         """Load AOI coordinates for each region from the AOI directory."""
@@ -1157,7 +1150,7 @@ class Controller:
                         coords = geojson["coordinates"][0]
                     aois[region] = coords
             except Exception as e:
-                self.logger.error(f"Error loading AOI for {region}: {str(e)}")
+                logging.error(f"Error loading AOI for {region}: {str(e)}")
                 continue
 
         if not aois:
@@ -1402,6 +1395,7 @@ def main():
     args = parser.parse_args()
 
     config = Config.from_env()
+    pdb.set_trace()
     controller = Controller(config, args.debug)
     controller.process_monthly_data(args.year, args.month)
 

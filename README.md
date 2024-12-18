@@ -33,8 +33,8 @@ From their you can run the main python script and inspect the output or run one 
 A .env config file is used to hold config settings for the script that aren't set with an argument. A default .env file is included with the repository. It assumes that you have a GLOFAS GFM account email address and password. A GLOFAS GFM account can be created by going to [the GFM portal](https://portal.gfm.eodc.eu/) and creating a free account. Once you have obtained an account then set the GFM_EMAIL and GFM_PASSWORD in the containers bash environment variables using:
 
 ```
-export GFM_EMAIL='"<GFM_account_email>"'
-export GFM_PASSWORD='"<GFM_account_password>"'
+export GFM_EMAIL='<GFM_account_email>'
+export GFM_PASSWORD='<GFM_account_password>'
 ```
 
 AWS credentials capable of accessing the s3 bucket where the filtered GFM data will be uploaded should also be entered into the default profile of the containers .aws/credentials file or in the shell environment that the script is being run within.
