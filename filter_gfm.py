@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from time import sleep
 from random import uniform
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple, List
 import pandas as pd
 import geopandas as gpd
 import rasterio
@@ -23,7 +23,6 @@ import re
 import urllib.request
 import requests
 from shapely.geometry import shape, Polygon
-from typing import List
 import tempfile
 import zipfile
 import shutil
@@ -32,10 +31,6 @@ import posixpath
 from google.cloud import storage
 import xarray as xr
 from dotenv import load_dotenv
-
-# setup nwm features so can be used across multiple processes
-shared_features = None
-
 
 @dataclass
 class Config:
@@ -122,7 +117,7 @@ class S3Uploader:
         self,
         product_path: str,
         flood_ratios: dict,
-        flowfile_info: Optional[tuple[pd.DataFrame, str]] = None,
+        flowfile_info: Optional[Tuple[pd.DataFrame, str]] = None,
     ):
         """
         Upload all product files, flood ratios, and optional flowfile to S3.
@@ -229,7 +224,7 @@ class GFMClient:
 
         Args:
             date_range: Tuple of (start_date, end_date)
-            aoi_coordinates: List of coordinates forming polygon
+            aoi_id: AOI ID
         """
 
         # Get products for AOI
@@ -710,21 +705,47 @@ class Product:
             return flood_pixels / ref_pixels if ref_pixels > 0 else 0.0
 
 
+class SharedData:
+    """Singleton class to hold shared features."""
+
+    _instance = None
+
+    def __new__(cls, config: Config):
+        if cls._instance is None:
+            cls._instance = super(SharedData, cls).__new__(cls)
+            cls._instance.load_features(config)
+        return cls._instance
+
+    def load_features(self, config: Config):
+        """Load hydrofabric features."""
+        logging.info("Loading hydrofabric features...")
+        # Load main hydrofabric
+        main_features = gpd.read_file(config.paths["main_hydrofabric"])
+        if main_features.crs != "EPSG:4326":
+            main_features = main_features.to_crs("EPSG:4326")
+        # Load Alaska hydrofabric
+        ak_features = gpd.read_file(config.paths["ak_hydrofabric"])
+        if ak_features.crs != "EPSG:4326":
+            ak_features = ak_features.to_crs("EPSG:4326")
+        # Create dictionary of features
+        self.features = {
+            "conus": main_features,
+            "hawaii": main_features,
+            "alaska": ak_features,
+        }
+        logging.info("Finished loading hydrofabric features.")
+
+
 class FlowProcessor:
     """Handles all flow data processing and NWM data extraction."""
 
     VALID_REGIONS = {"conus", "alaska", "hawaii"}
 
-    def __init__(self, features: Dict[str, gpd.GeoDataFrame]):
-        self.features = features
+    def __init__(self, config: Config):
+        shared_data = SharedData(config)
+        self.features = shared_data.features
         self.gcs_client = storage.Client.create_anonymous_client()
         self.nwm_bucket = self.gcs_client.bucket("national-water-model")
-
-    @classmethod
-    def from_shared_features(cls):
-        """Create FlowProcessor using shared features."""
-        global shared_features
-        return cls(shared_features)
 
     def create_flowfile(
         self, polygon: Polygon, target_datetime: datetime, region: str = "conus"
@@ -1109,24 +1130,9 @@ class Controller:
         self._load_hydrofabric()
 
     def _load_hydrofabric(self):
-        """Load hydrofabric features into shared_features."""
-        global shared_features
-        logging.info("Loading hydrofabric features...")
-        # Load main hydrofabric
-        main_features = gpd.read_file(self.config.paths["main_hydrofabric"])
-        if main_features.crs != "EPSG:4326":
-            main_features = main_features.to_crs("EPSG:4326")
-        # Load Alaska hydrofabric
-        ak_features = gpd.read_file(self.config.paths["ak_hydrofabric"])
-        if ak_features.crs != "EPSG:4326":
-            ak_features = ak_features.to_crs("EPSG:4326")
-        # Create dictionary of features
-        shared_features = {
-            "conus": main_features,
-            "hawaii": main_features,
-            "alaska": ak_features,
-        }
-        logging.info("Finished loading hydrofabric features.")
+        """Load hydrofabric features before child processes are created."""
+        # Ensure that SharedData singleton is instantiated before forking processes
+        SharedData(self.config)
 
     def _load_region_aois(self) -> Dict[str, List]:
         """Load AOI coordinates for each region from the AOI directory."""
@@ -1252,8 +1258,8 @@ class Controller:
             # Create new instances for this process
             gfm_client = GFMClient(self.config, self.logger)
 
-            # Create FlowProcessor using shared hydrofabric features
-            flow_processor = FlowProcessor.from_shared_features()
+            # Create FlowProcessor
+            flow_processor = FlowProcessor(self.config)
 
             # Download and process product using the AOI ID
             try:
@@ -1395,12 +1401,11 @@ def main():
     args = parser.parse_args()
 
     config = Config.from_env()
-    pdb.set_trace()
     controller = Controller(config, args.debug)
     controller.process_monthly_data(args.year, args.month)
 
 
 if __name__ == "__main__":
-    # set multiprocessing start method explicitely to handle global nwm features
+    # set multiprocessing start method explicitly to handle shared data
     multiprocessing.set_start_method("fork")
     main()
