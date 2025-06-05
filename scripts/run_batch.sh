@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Directory containing the Python script
-SCRIPT_DIR="$HOME/pull-gfm/"
+SCRIPT_DIR="$HOME/gfm-puller/"
 # Logs directory
 LOGS_DIR="${SCRIPT_DIR%/}/logs"
 
@@ -108,7 +108,7 @@ while [ $((current_year * 100 + current_month)) -le "$end_num" ]; do
     formatted_month=$(printf "%02d" "$current_month")
     
     # Run Python script and redirect output to file
-    python filter_gfm.py --month "$formatted_month" --year "$current_year" >> "$output_file" 2>&1
+    "$SCRIPT_DIR/.venv/bin/python" filter_gfm.py --month "$formatted_month" --year "$current_year" >> "$output_file" 2>&1
     
     # Add separator
     echo "----------------------------------------" >> "$output_file"
