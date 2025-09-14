@@ -9,7 +9,7 @@ Data is obtained, analyzed, and uploaded in 1 month increments.
 To obtain GFM data using this repository you need to: 
 
 0. Clone the repository to "pull-gfm"
-1. create a directory called "hydrofabrics" inside the repo and copy "nwm_flows.gpkg" and "nwm_flows_alaska_nwmV3_ID.gpkg" to it. This can be done by navigating to "./pull-gfm/hydrofabrics" and then running `aws s3 cp s3://noaa-nws-owp-fim/hand_fim/inputs/nwm_hydrofabric/nwm_flows_alaska_nwmV3_ID.gpkg . --request-payer requester` and `aws s3 cp s3://noaa-nws-owp-fim/hand_fim/inputs/nwm_hydrofabric/nwm_flows_alaska_nwmV3_ID.gpkg . --request-payer requester`  
+1. create a directory called "hydrofabrics" inside the repo and copy "nwm_flows.gpkg" and "nwm_flows_alaska_nwmV3_ID.gpkg" to it. This can be done by navigating to "./pull-gfm/hydrofabrics" and then running `aws s3 cp s3://noaa-nws-owp-fim/hand_fim/inputs/nwm_hydrofabric/nwm_flows.gpkg . --request-payer requester` and `aws s3 cp s3://noaa-nws-owp-fim/hand_fim/inputs/nwm_hydrofabric/nwm_flows_alaska_nwmV3_ID.gpkg . --request-payer requester`  
 2. Build and enter the docker container using the instructions below.
 3. Load AWS credentials into docker containers  ~/.aws/credentials or the containers bash environment for the s3 bucket you want to upload data to.
 4. Construct a valid [configuration file](#config-file) inside the running container. Instructions for doing this are below.
